@@ -1,0 +1,101 @@
+{
+  "ANNOT_DIR": "/Users/arinazamyshevskaya/Desktop/hwml1/kemocon_baseline/data/emotion_annotations/aggregated_external_annotations",
+  "DATA_ROOT": "/Users/arinazamyshevskaya/Desktop/hwml1/kemocon_baseline/data",
+  "DYADS": [
+    [
+      1,
+      2
+    ],
+    [
+      3,
+      4
+    ],
+    [
+      5,
+      6
+    ],
+    [
+      7,
+      8
+    ],
+    [
+      9,
+      10
+    ],
+    [
+      11,
+      12
+    ],
+    [
+      13,
+      14
+    ],
+    [
+      15,
+      16
+    ],
+    [
+      17,
+      18
+    ],
+    [
+      19,
+      20
+    ],
+    [
+      21,
+      22
+    ],
+    [
+      23,
+      24
+    ],
+    [
+      25,
+      26
+    ],
+    [
+      27,
+      28
+    ],
+    [
+      29,
+      30
+    ],
+    [
+      31,
+      32
+    ]
+  ],
+  "E4_DIR": "/Users/arinazamyshevskaya/Desktop/hwml1/kemocon_baseline/data/e4_data",
+  "LAGS": [
+    0,
+    1,
+    2,
+    3,
+    4
+  ],
+  "LSTM_BATCH": 16,
+  "LSTM_EPOCHS": 50,
+  "LSTM_HIDDEN": 32,
+  "LSTM_LR": 0.001,
+  "METADATA_DIR": "/Users/arinazamyshevskaya/Desktop/hwml1/kemocon_baseline/data/metadata",
+  "NEURO_DIR": "/Users/arinazamyshevskaya/Desktop/hwml1/kemocon_baseline/data/neurosky_polar_data",
+  "OPTUNA_INNER_SPLITS": 3,
+  "OPTUNA_TRIALS": 10,
+  "PROJECT_ROOT": "/Users/arinazamyshevskaya/Desktop/hwml1/kemocon_baseline",
+  "Path": "<class 'pathlib.Path'>",
+  "RANDOM_SEED": 42,
+  "RIDGE_ALPHA": 1.0,
+  "SEGMENT_SEC": 5,
+  "SVR_C": 1.0,
+  "SVR_GAMMA": "scale",
+  "TARGETS": [
+    "arousal",
+    "valence"
+  ],
+  "WIN_OFFSET_400MS": 0.4,
+  "XGB_DEPTH": 3,
+  "XGB_LR": 0.05,
+  "XGB_N": 200
+}
