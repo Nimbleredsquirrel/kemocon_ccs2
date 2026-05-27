@@ -1,0 +1,630 @@
+import warnings
+warnings.filterwarnings("ignore")
+
+import argparse
+import json
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from datetime import datetime
+
+import config as _config
+from config import DYADS, TARGETS, DATA_ROOT, LAGS, SEGMENT_SEC
+from data_loader import (load_metadata, get_start_time,
+                          load_e4_all, load_neuro_all,
+                          load_annotations, load_partner_annotations,
+                          load_self_annotations, load_baseline_stats)
+from features import build_segment_features
+import audio_features as aud
+import video_features as vid
+from dataset import (make_pairs, make_own_signal_pairs, make_random_dyad_pairs,
+                     make_circular_shift_pairs, make_label_ar_pairs,
+                     make_label_delta_pairs, make_missingness_pairs,
+                     make_incremental_pairs)
+from train import run_loso, summarise
+from evaluate import annotation_agreement, compare_conditions
+from data_quality import print_quality_report, usable_dyads, nan_fraction_per_session
+import plots
+
+RESULTS_ROOT = Path(__file__).parent / "results"
+RESULTS_ROOT.mkdir(exist_ok=True)
+
+OUT_DIR: Path = RESULTS_ROOT  # overridden in main() once args are known
+
+def load_physio(subjects, use_baseline_norm: bool = True, win_offset: float = 0.0):
+    seg_tables = {}
+    for pid in sorted(subjects["pid"].unique()):
+        try:
+            start_ms = get_start_time(pid, subjects)
+            e4 = load_e4_all(pid, start_ms)
+            neuro = load_neuro_all(pid, start_ms)
+            annot = load_annotations(pid)
+            if annot is None or len(annot) < 5:
+                continue
+
+            bl_stats = load_baseline_stats(pid, subjects) if use_baseline_norm else None
+            seg = build_segment_features(pid, e4, neuro, annot, bl_stats,
+                                         win_offset=win_offset)
+            seg_tables[pid] = seg
+            bl_tag = f"  [BL-norm: {len(bl_stats)} signals]" if bl_stats else ""
+            print(f"  P{pid}: {len(seg)} segs{bl_tag}")
+        except Exception as exc:
+            print(f"  P{pid}: ERROR — {exc}")
+    return seg_tables
+
+def merge_audio(seg_tables, offset: float = 0.0):
+    for pid_a, pid_b in DYADS:
+        if pid_a not in seg_tables and pid_b not in seg_tables:
+            continue
+        n_a = len(seg_tables.get(pid_a, pd.DataFrame()))
+        n_b = len(seg_tables.get(pid_b, pd.DataFrame()))
+        df_aud_a, df_aud_b = aud.load_or_extract(pid_a, pid_b, n_a, n_b, offset=offset)
+        for pid, df_aud in [(pid_a, df_aud_a), (pid_b, df_aud_b)]:
+            if pid in seg_tables:
+                seg_tables[pid] = aud.merge_audio_into_seg_table(seg_tables[pid], df_aud)
+    return seg_tables
+
+def merge_video(seg_tables, offset: float = 0.0):
+    pids_with_video = sorted(vid._VIDEO_MAP.keys())
+    print(f"\n  Video available for {len(pids_with_video)}/32 participants")
+    for pid in pids_with_video:
+        if pid not in seg_tables:
+            continue
+        df_vid = vid.load_or_extract(pid, len(seg_tables[pid]), offset=offset)
+        if df_vid is not None:
+            seg_tables[pid] = vid.merge_video_into_seg_table(seg_tables[pid], df_vid)
+    return seg_tables
+
+def standardise_columns(seg_tables):
+    """Ensure all tables have the same feature columns in the same order."""
+    all_cols = set()
+    for df in seg_tables.values():
+        all_cols.update(df.columns)
+    meta = {"pid", "seconds", "arousal", "valence"}
+    ordered = ["pid", "seconds", "arousal", "valence"] + sorted(all_cols - meta)
+    for pid in seg_tables:
+        for col in sorted(all_cols - meta):
+            if col not in seg_tables[pid].columns:
+                seg_tables[pid][col] = np.nan
+        seg_tables[pid] = seg_tables[pid][ordered]
+    return seg_tables
+
+def _swap_labels(seg_tables_ext: dict, loader_fn) -> dict:
+    """
+    Return seg_tables with arousal/valence replaced by another perspective's labels.
+    Physiological & audio/video features remain the same.
+    """
+    out = {}
+    for pid, df in seg_tables_ext.items():
+        annot = loader_fn(pid)
+        if annot is None or len(annot) < 5:
+            continue
+        df_new = df.copy()
+        indexed = annot.set_index("seconds")
+        secs = df_new["seconds"].values
+        df_new["arousal"] = [float(indexed.loc[s, "arousal"])
+                              if s in indexed.index else np.nan for s in secs]
+        df_new["valence"] = [float(indexed.loc[s, "valence"])
+                              if s in indexed.index else np.nan for s in secs]
+        df_new = df_new.dropna(subset=["arousal", "valence"]).reset_index(drop=True)
+        if len(df_new) >= 5:
+            out[pid] = df_new
+    return out
+
+def build_partner_seg_tables(seg_tables_ext: dict, subjects: pd.DataFrame) -> dict:
+    return _swap_labels(seg_tables_ext, load_partner_annotations)
+
+def build_self_seg_tables(seg_tables_ext: dict) -> dict:
+    return _swap_labels(seg_tables_ext, load_self_annotations)
+
+def save_feature_importances(pairs, tag: str = ""):
+    from models import GradientBoostingModel, CatBoostModel
+    import json
+
+    feat_names = None
+    for p in pairs:
+        if p["target"] == "arousal" and p["condition"] == "sync":
+            feat_names = p["feature_names"]
+            break
+    if feat_names is None:
+        return
+
+    for ModelClass in [GradientBoostingModel, CatBoostModel]:
+        m_instance = ModelClass()
+        for target in TARGETS:
+            sel = [p for p in pairs if p["target"]==target and p["condition"]=="sync"]
+            if not sel:
+                continue
+            X = np.vstack([p["X"] for p in sel])
+            y = np.concatenate([p["y"] for p in sel])
+            try:
+                m_instance.fit(X, y)
+            except Exception:
+                continue
+            if m_instance.feature_importances_ is not None:
+                imp = dict(zip(feat_names, m_instance.feature_importances_.tolist()))
+                imp_sorted = dict(sorted(imp.items(), key=lambda x: x[1], reverse=True)[:20])
+                suffix = f"_{m_instance.name.lower()}{tag}"
+                path = OUT_DIR / f"feature_importance_{target}{suffix}.json"
+                with open(path, "w") as f:
+                    json.dump(imp_sorted, f, indent=2)
+                top5 = list(imp_sorted.keys())[:5]
+                print(f"  {m_instance.name} top-5 ({target}): {', '.join(top5)}")
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="K-EmoCon cross-person emotion prediction pipeline")
+    parser.add_argument("--no-video",      action="store_true",
+                        help="Skip video features")
+    parser.add_argument("--no-audio",      action="store_true",
+                        help="Skip audio features")
+    parser.add_argument("--physio-only",   action="store_true",
+                        help="Use physiological features only")
+    parser.add_argument("--no-optuna",     action="store_true",
+                        help="Skip CatBoostOptuna (much faster)")
+    parser.add_argument("--ablation",      action="store_true",
+                        help="Run modality ablation (physio/audio/video/all)")
+    parser.add_argument("--no-controls",   action="store_true",
+                        help="Skip negative-control baselines (own-signal, random-dyad, circular-shift)")
+    parser.add_argument("--no-incremental", action="store_true",
+                        help="Skip incremental model comparison (M1→M4)")
+    parser.add_argument("--no-delta",      action="store_true",
+                        help="Skip label-delta (ΔA_label) target analysis")
+    parser.add_argument("--no-agreement",  action="store_true",
+                        help="Skip annotation agreement analysis")
+    return parser.parse_args()
+
+def make_run_dir(args) -> Path:
+    """
+    Create and return a timestamped, descriptive subdirectory under results/.
+
+    Naming convention:
+      run_YYYYMMDD_HHMM_<modalities>_<optuna>_<controls>
+
+    Examples:
+      run_20250527_1430_physio+audio+video_optuna_controls
+      run_20250527_1530_physio-only_no-optuna_no-controls
+    """
+    ts = datetime.now().strftime("%Y%m%d_%H%M")
+
+    # Modalities tag
+    if args.physio_only:
+        mods = "physio-only"
+    else:
+        parts = ["physio"]
+        if not args.no_audio:
+            parts.append("audio")
+        if not args.no_video:
+            parts.append("video")
+        mods = "+".join(parts)
+
+    opts = "no-optuna" if args.no_optuna else "optuna"
+    ctrl = "no-controls" if args.no_controls else "controls"
+
+    name = f"run_{ts}_{mods}_{opts}_{ctrl}"
+    out  = RESULTS_ROOT / name
+    out.mkdir(parents=True, exist_ok=True)
+
+    # figures/ lives inside the run dir, not the global results/
+    (out / "figures").mkdir(exist_ok=True)
+    return out
+
+def smoke_test() -> bool:
+    """Verify required data directories exist before training."""
+    from config import DATA_ROOT, E4_DIR, ANNOT_DIR, METADATA_DIR
+    required = {
+        "E4 data":          E4_DIR,
+        "Annotations":      ANNOT_DIR,
+        "Metadata":         METADATA_DIR,
+    }
+    missing = {name: path for name, path in required.items() if not path.exists()}
+    if missing:
+        print("\nERROR: Missing required data directories:")
+        for name, path in missing.items():
+            print(f"  {name}: {path}")
+        print("\nRun:  python3 setup_data.py --kemocon-root /path/to/kemocon_extracted")
+        return False
+    return True
+
+def save_config(out_dir: Path) -> None:
+    """Save a snapshot of config values alongside results."""
+    snap = {}
+    for k in dir(_config):
+        if k.startswith("_"):
+            continue
+        v = getattr(_config, k)
+        if isinstance(v, (int, float, str, list, bool)):
+            snap[k] = v
+        elif hasattr(v, "__fspath__"):   # Path
+            snap[k] = str(v)
+    with open(out_dir / "config_snapshot.json", "w") as f:
+        json.dump(snap, f, indent=2, default=str)
+    print(f"  Config saved → {out_dir}/config_snapshot.json")
+
+def main():
+    args = parse_args()
+
+    print("K-EmoCon: Cross-Person Multimodal Emotion Prediction")
+    print("=" * 55)
+
+    if not smoke_test():
+        return
+
+    # Create run-specific output directory and redirect plots there
+    global OUT_DIR
+    OUT_DIR = make_run_dir(args)
+    plots.FIG_DIR = OUT_DIR / "figures"
+    plots.FIG_DIR.mkdir(exist_ok=True)
+    print(f"\nRun output → {OUT_DIR.name}/")
+
+    subjects, _ = load_metadata()
+    print(f"Participants: {len(subjects)}")
+
+    use_audio = not (args.no_audio or args.physio_only)
+    use_video = not (args.no_video or args.physio_only)
+    print(f"Modalities: physio=ON  audio={'ON' if use_audio else 'OFF'}  "
+          f"video={'ON' if use_video else 'OFF'}")
+
+    # Optionally disable slow models
+    if args.no_optuna:
+        import models as _models
+        _orig = _models.all_models
+        _models.all_models = lambda: [m for m in _orig()
+                                       if m.name != "CatBoostOptuna"]
+        print("  [--no-optuna] CatBoostOptuna disabled")
+
+    # ── 1. Load features ──────────────────────────────────────────────────
+    print("\n[1/5] Loading physio + baseline normalisation …")
+    seg_tables = load_physio(subjects, use_baseline_norm=True, win_offset=0.0)
+    print(f"Loaded: {len(seg_tables)} participants")
+
+    if use_audio:
+        print("\n[2/5] Merging audio features (eGeMAPS) …")
+        seg_tables = merge_audio(seg_tables, offset=0.0)
+    else:
+        print("\n[2/5] Audio skipped.")
+
+    if use_video:
+        print("\n[3/5] Merging video features …")
+        seg_tables = merge_video(seg_tables, offset=0.0)
+    else:
+        print("\n[3/5] Video skipped.")
+
+    seg_tables = standardise_columns(seg_tables)
+
+    # 400ms-offset tables: physio at 0ms (400ms meaningless at 5s resolution),
+    # audio/video re-extracted at 400ms offset.
+    print("\n[1b] Building 400ms-offset tables (audio/video only; physio unchanged) …")
+    seg_tables_400ms = {pid: df.copy() for pid, df in seg_tables.items()}
+    if use_audio or use_video:
+        # Strip old audio/video from copies; re-add with 400ms offset
+        for pid in seg_tables_400ms:
+            av_cols = [c for c in seg_tables_400ms[pid].columns
+                       if c.startswith(("aud_", "vid_"))]
+            seg_tables_400ms[pid] = seg_tables_400ms[pid].drop(columns=av_cols)
+        if use_audio:
+            seg_tables_400ms = merge_audio(seg_tables_400ms, offset=0.4)
+        if use_video:
+            seg_tables_400ms = merge_video(seg_tables_400ms, offset=0.4)
+        seg_tables_400ms = standardise_columns(seg_tables_400ms)
+    print(f"  400ms tables: {len(seg_tables_400ms)} participants")
+
+    # Feature summary
+    sample = next(iter(seg_tables.values()))
+    feat_cols = [c for c in sample.columns
+                 if c not in {"pid", "seconds", "arousal", "valence"}]
+    n_p = sum(1 for c in feat_cols if c.startswith(("e4_","bw_","attention","meditation","polar")))
+    n_a = sum(1 for c in feat_cols if c.startswith("aud_"))
+    n_v = sum(1 for c in feat_cols if c.startswith("vid_"))
+    print(f"\nFeature set: {len(feat_cols)} total  ({n_p} physio | {n_a} audio | {n_v} video)")
+
+    # ── 2. Quality & usability ─────────────────────────────────────────────
+    print("\n[4/5] Data quality …")
+    print_quality_report(seg_tables, DYADS)
+    nan_df = nan_fraction_per_session(seg_tables)
+    good_dyads = usable_dyads(nan_df, DYADS, max_nan=0.8)
+    print(f"Usable dyads: {len(good_dyads)} / {len(DYADS)}")
+
+    if not good_dyads:
+        print("No usable dyads — check DATA_ROOT in config.py"); return
+
+    # ── 3. Primary LOSO (cross-person + 400ms + negative controls) ─────────
+    print("\n[5/5] Cross-person prediction — PRIMARY (external observer) …")
+    pairs_ext = make_pairs(seg_tables, good_dyads)
+    pairs_ext += make_pairs(seg_tables_400ms, good_dyads,
+                             conditions=[(0, "lag_400ms")])
+
+    if not args.no_controls:
+        print("  Adding negative-control pairs …")
+        pairs_ext += make_own_signal_pairs(seg_tables, good_dyads,
+                                            conditions=[(0, "own_signal")])
+        pairs_ext += make_random_dyad_pairs(seg_tables, good_dyads,
+                                             conditions=[(0, "random_dyad")])
+        pairs_ext += make_circular_shift_pairs(seg_tables, good_dyads,
+                                                conditions=[(0, "circ_shift")])
+        # Label autoregression — most important missing baseline
+        print("  Adding label autoregression baselines …")
+        pairs_ext += make_label_ar_pairs(seg_tables, good_dyads, mode="own")
+        pairs_ext += make_label_ar_pairs(seg_tables, good_dyads, mode="partner")
+        pairs_ext += make_label_ar_pairs(seg_tables, good_dyads, mode="combined")
+        # Missingness red-flag baseline
+        pairs_ext += make_missingness_pairs(seg_tables, good_dyads)
+
+    _print_pair_summary(pairs_ext)
+
+    print("\nRunning LOSO CV (primary) …")
+    results_ext = run_loso(pairs_ext)
+    summary_ext = summarise(results_ext)
+
+    print("\n=== Primary Results (External Observer) ===")
+    print(summary_ext.to_string(index=False))
+    _print_hypothesis_tests(summary_ext)
+
+    # Permutation tests: real partner (lag_0) vs controls
+    print("\n--- Permutation Tests (lag_0 vs baselines) ---")
+    _run_permutation_tests(results_ext, summary_ext)
+
+    results_ext.to_csv(OUT_DIR / "loso_results_primary.csv", index=False)
+    summary_ext.to_csv(OUT_DIR / "loso_summary_primary.csv", index=False)
+    save_config(OUT_DIR)
+    print(f"\nPrimary results saved → {OUT_DIR}/")
+
+    print("\nFeature importances …")
+    save_feature_importances(pairs_ext)
+
+    # ── 4. Secondary: partner + self-report annotations ────────────────────
+    print("\n--- Secondary Analysis: All Annotation Perspectives ---")
+    seg_tables_par = build_partner_seg_tables(seg_tables, subjects)
+    seg_tables_self = build_self_seg_tables(seg_tables)
+    print(f"  Partner annotations: {len(seg_tables_par)} participants")
+    print(f"  Self-report:         {len(seg_tables_self)} participants")
+
+    summary_par = _run_annotation_perspective(seg_tables_par, good_dyads, "partner", OUT_DIR)
+    summary_self = _run_annotation_perspective(seg_tables_self, good_dyads, "self",     OUT_DIR)
+
+    # ── 5. Annotation agreement (reliability ceiling) ──────────────────────
+    agreement_dfs = None
+    if not args.no_agreement:
+        print("\n--- Annotation Agreement (inter-perspective reliability ceiling) ---")
+        agreement_dfs = {}
+        for target in TARGETS:
+            agreement_dfs[target] = {}
+            for pair_name, (st_a, st_b) in [
+                ("self_vs_ext",     (seg_tables_self, seg_tables)),
+                ("partner_vs_ext",  (seg_tables_par,  seg_tables)),
+                ("self_vs_partner", (seg_tables_self, seg_tables_par)),
+            ]:
+                ag = annotation_agreement(st_a, st_b, good_dyads, target)
+                agreement_dfs[target][pair_name] = ag
+                if not ag.empty:
+                    print(f"  {target:8s} {pair_name:20s}: "
+                          f"median r = {ag['r'].median():.3f}  "
+                          f"(n={len(ag)} participants)")
+        print("\n  NOTE: Model CCC ceiling ≈ self/external agreement (above).")
+
+    # ── 6. Label delta targets ─────────────────────────────────────────────
+    summary_delta = None
+    if not args.no_delta:
+        print("\n--- Label Delta Analysis (predict ΔA_label[t]) ---")
+        pairs_delta = make_label_delta_pairs(seg_tables, good_dyads)
+        if pairs_delta:
+            results_delta = run_loso(pairs_delta)
+            summary_delta = summarise(results_delta)
+            if not summary_delta.empty:
+                print("=== Delta Results ===")
+                print(summary_delta.to_string(index=False))
+                results_delta.to_csv(OUT_DIR / "loso_results_delta.csv", index=False)
+                summary_delta.to_csv(OUT_DIR / "loso_summary_delta.csv", index=False)
+            else:
+                print("  [SKIP] delta run produced no results")
+        else:
+            print("  [SKIP] no delta pairs built")
+
+    # ── 7. Incremental model comparison (M1→M4) ────────────────────────────
+    summary_incr = None
+    if not args.no_incremental:
+        print("\n--- Incremental Model Comparison (M1→M4) ---")
+        print("  Key: ΔCCC(M4 − M2) = added value of partner physio")
+        pairs_incr = make_incremental_pairs(seg_tables, good_dyads)
+        if pairs_incr:
+            # Fast-only: skip Optuna for incremental
+            import models as _mods
+            _orig_all = _mods.all_models
+            _mods.all_models = lambda: [m for m in _orig_all()
+                                         if m.name in ("RidgeCV", "CatBoost",
+                                                        "MeanBaseline")]
+            results_incr = run_loso(pairs_incr)
+            _mods.all_models = _orig_all
+            summary_incr = summarise(results_incr)
+            print("\n=== Incremental Results ===")
+            print(summary_incr.to_string(index=False))
+            _print_incremental_delta(summary_incr)
+            results_incr.to_csv(OUT_DIR / "loso_results_incremental.csv", index=False)
+            summary_incr.to_csv(OUT_DIR / "loso_summary_incremental.csv", index=False)
+        else:
+            print("  [SKIP] no incremental pairs built")
+
+    # ── 8. Modality ablation ───────────────────────────────────────────────
+    if args.ablation:
+        print("\n--- Modality Ablation ---")
+        _run_ablation(subjects, good_dyads, OUT_DIR)
+
+    # ── 9. Plots ───────────────────────────────────────────────────────────
+    # Flatten agreement dfs for plots: {label: {pair_name: df}} → {pair_name: df}
+    ag_for_plots = None
+    if agreement_dfs:
+        # Use arousal agreement for the combined plot (or pick first target)
+        ag_for_plots = agreement_dfs.get(TARGETS[0], None)
+
+    plots.generate_all(results_ext, summary_ext, OUT_DIR, summary_par,
+                       agreement_dfs=ag_for_plots,
+                       summary_incremental=summary_incr)
+    if summary_par is not None:
+        plots.plot_ccc_comparison(summary_par, tag="partner")
+    if summary_self is not None:
+        plots.plot_ccc_comparison(summary_self, tag="self")
+
+    # Full agreement plots per target
+    if agreement_dfs:
+        for target in TARGETS:
+            plots.plot_annotation_agreement(agreement_dfs[target], target)
+
+    print(f"\nDone. All outputs in {OUT_DIR}/")
+
+def _run_annotation_perspective(seg_tables_persp, good_dyads, tag, out_dir):
+    """Run LOSO on a given annotation perspective (lag_0 only for speed)."""
+    pairs = make_pairs(seg_tables_persp, good_dyads, conditions=[(0, "lag_0")])
+    if not pairs:
+        print(f"  [SKIP] {tag}: no pairs built")
+        return None
+    print(f"\nRunning LOSO CV ({tag} annotations) …")
+    results = run_loso(pairs)
+    summary = summarise(results)
+    print(f"=== {tag.title()} Annotation Results ===")
+    # Print only CCC columns to keep output readable
+    cols = ["model", "target", "condition", "ccc_mean", "ccc_std",
+            "ccc_ci_lo", "ccc_ci_hi"]
+    print(summary[[c for c in cols if c in summary.columns]].to_string(index=False))
+    results.to_csv(out_dir / f"loso_results_{tag}.csv", index=False)
+    summary.to_csv(out_dir / f"loso_summary_{tag}.csv", index=False)
+    return summary
+
+def _run_permutation_tests(results_df, summary_df):
+    """
+    For each (target, model): test real partner (lag_0) > label_ar_own.
+    Uses both Wilcoxon signed-rank and sign-flip permutation tests.
+    Prints a compact table.
+    """
+    baselines = ["label_ar_own", "random_dyad", "circ_shift", "own_signal"]
+    baselines = [b for b in baselines if b in results_df["condition"].values]
+    if not baselines:
+        print("  (no baseline conditions available for permutation tests)")
+        return
+
+    best_model = "CatBoost"
+    if best_model not in results_df["model"].values:
+        best_model = results_df["model"].unique()[0]
+
+    rows = []
+    for target in TARGETS:
+        for baseline in baselines:
+            res = compare_conditions(results_df, best_model, target, "lag_0", baseline)
+            rows.append(res)
+
+    df = pd.DataFrame(rows)
+    print(df[["target", "cond_b", "median_delta",
+              "wilcoxon_p", "signflip_p"]].to_string(index=False))
+    df.to_csv(OUT_DIR / "permutation_tests.csv", index=False)
+    print("  (Wilcoxon / sign-flip one-sided H1: lag_0 > baseline)")
+
+def _print_incremental_delta(summary):
+    """Print ΔCCC table for M1→M4."""
+    print("\n  Model  Target  M1→M2 (own physio)  M2→M3 (partner labels)  M2→M4 (partner physio)")
+    for target in TARGETS:
+        sub = summary[summary["target"] == target]
+        for model in ["RidgeCV", "CatBoost"]:
+            m_sub = sub[sub["model"] == model]
+            def _ccc(cond):
+                r = m_sub[m_sub["condition"] == cond]["ccc_mean"].values
+                return float(r[0]) if len(r) else np.nan
+            m1 = _ccc("M1_own_label_ar")
+            m2 = _ccc("M2_own_signal")
+            m3 = _ccc("M3_label_coupling")
+            m4 = _ccc("M4_full")
+            print(f"  {model:10s} {target:8s}  "
+                  f"Δ(M2−M1)={m2-m1:+.4f}  "
+                  f"Δ(M3−M1)={m3-m1:+.4f}  "
+                  f"Δ(M4−M2)={m4-m2:+.4f}  "
+                  f"[M4={m4:.4f}]")
+
+def _run_ablation(subjects, good_dyads, out_dir):
+    """Run LOSO for each modality subset and save results."""
+    from models import all_models as _all_models
+    import models as _mods
+
+    # Fast ablation: use only RidgeCV + CatBoost (skip Optuna)
+    _orig_all = _mods.all_models
+    _mods.all_models = lambda: [m for m in _orig_all()
+                                 if m.name in ("RidgeCV", "CatBoost", "MeanBaseline")]
+
+    modalities = {
+        "physio":     (False, False),   # (use_audio, use_video)
+        "audio":      (True,  False),
+        "video":      (False, True),
+        "all":        (True,  True),
+    }
+
+    ablation_summaries = {}
+    for name, (ua, uv) in modalities.items():
+        print(f"\n  Ablation: {name} …")
+        st = load_physio(subjects, use_baseline_norm=True)
+        if ua:
+            st = merge_audio(st)
+        if uv:
+            st = merge_video(st)
+        st = standardise_columns(st)
+        pairs = make_pairs(st, good_dyads, conditions=[(0, "lag_0")])
+        if not pairs:
+            continue
+        res = run_loso(pairs)
+        summ = summarise(res)
+        summ["modality"] = name
+        ablation_summaries[name] = summ
+        res.to_csv(out_dir / f"ablation_{name}_results.csv", index=False)
+        summ.to_csv(out_dir / f"ablation_{name}_summary.csv", index=False)
+
+    _mods.all_models = _orig_all
+
+    if ablation_summaries:
+        combined = pd.concat(ablation_summaries.values(), ignore_index=True)
+        print("\n=== Modality Ablation Summary (lag_0, CCC mean) ===")
+        pivot = combined.pivot_table(
+            index=["modality", "target"], columns="model",
+            values="ccc_mean", aggfunc="first"
+        )
+        print(pivot.to_string())
+        plots.plot_ablation(ablation_summaries, out_dir)
+
+def _print_pair_summary(pairs):
+    conds = sorted({p["condition"] for p in pairs})
+    for t in TARGETS:
+        for c in conds:
+            n = sum(1 for p in pairs if p["target"]==t and p["condition"]==c)
+            s = sum(len(p["y"]) for p in pairs if p["target"]==t and p["condition"]==c)
+            print(f"  {t:8s} {c:15s}: {n:3d} pairs, {s:5d} segments")
+
+def _print_hypothesis_tests(summary):
+    print("\n--- H₁: best CCC above chance? ---")
+    for t in TARGETS:
+        sub = summary[summary["target"]==t].sort_values("ccc_mean", ascending=False)
+        best = sub.iloc[0]
+        sign = ("✓ supported"  if best["ccc_mean"] > 0.05 else
+                "~ marginal"   if best["ccc_mean"] > 0   else
+                "✗ not supported")
+        print(f"  {t:8s}  best={best['model']:20s}  cond={best['condition']}  "
+              f"CCC={best['ccc_mean']:.4f}  {sign}")
+
+    print("\n--- H₂: best lag vs synchronous (lag_0)? ---")
+    for t in TARGETS:
+        print(f"\n  {t}:")
+        for m in summary["model"].unique():
+            sub = summary[(summary["model"]==m) & (summary["target"]==t)]
+            lag0 = sub[sub["condition"]=="lag_0"]["ccc_mean"].values
+            if not len(lag0):
+                continue
+            best_lag = sub.sort_values("ccc_mean", ascending=False).iloc[0]
+            d = float(best_lag["ccc_mean"] - lag0[0])
+            print(f"    {m:20s}  sync={lag0[0]:.4f}  "
+                  f"best={best_lag['ccc_mean']:.4f} @ {best_lag['condition']}  Δ={d:+.4f}  "
+                  f"{'✓' if d>0 else '✗'}")
+
+    print("\n--- Best lag per target (averaged across models) ---")
+    for t in TARGETS:
+        sub = summary[summary["target"]==t]
+        lag_means = sub.groupby("condition")["ccc_mean"].mean().sort_values(ascending=False)
+        print(f"  {t}:")
+        for cond, val in lag_means.items():
+            print(f"    {cond}: CCC={val:.4f}")
+
+if __name__ == "__main__":
+    main()
