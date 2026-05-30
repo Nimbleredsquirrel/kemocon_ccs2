@@ -32,3 +32,6 @@ TARGETS = ["arousal", "valence"]
 LAGS = [0, 1, 2, 3, 4]
 RANDOM_SEED = 42
 WIN_OFFSET_400MS = 0.4
+
+# Synchrony feature windows in segments (3→15s, 6→30s, 12→60s)
+SYNCHRONY_WINDOWS = (3, 6, 12)

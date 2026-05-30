@@ -1,4 +1,4 @@
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 """
 Build cross-person prediction pairs from pre-computed per-segment feature tables.
 
@@ -13,7 +13,7 @@ Returns a list of dicts:
     "pid_A": int,
     "pid_B": int,
     "target": str,               # "arousal" or "valence"
-    "condition": str,            # "sync" or "retro"
+    "condition": str,            # e.g. "lag_0", "sync_lag_0"
     "X": np.ndarray,             # (n_segments, n_features)
     "y": np.ndarray,             # (n_segments,)
     "feature_names": list[str],
@@ -25,6 +25,93 @@ from config import TARGETS, LAGS
 
 
 FEATURE_COLS: Optional[List[str]] = None  # filled on first call
+
+
+# ── Synchrony helpers ────────────────────────────────────────────────────────
+
+def _impute_cols(X: np.ndarray) -> np.ndarray:
+    """Median-impute columns (for synchrony feature computation)."""
+    X = X.copy()
+    meds = np.nanmedian(X, axis=0)
+    meds = np.where(np.isnan(meds), 0.0, meds)
+    for j in range(X.shape[1]):
+        bad = np.isnan(X[:, j])
+        if bad.any():
+            X[bad, j] = meds[j]
+    return X
+
+
+def _rolling_corr(Za: np.ndarray, Zb: np.ndarray, w: int) -> np.ndarray:
+    """
+    Vectorized rolling Pearson correlation per feature column.
+    Returns (n, d) with NaN for the first w-1 timesteps.
+    """
+    from numpy.lib.stride_tricks import sliding_window_view
+    n, d = Za.shape
+    out = np.full((n, d), np.nan)
+    if n < w:
+        return out
+    for j in range(d):
+        a = Za[:, j]
+        b = Zb[:, j]
+        aw = sliding_window_view(a, w)          # (n-w+1, w)
+        bw = sliding_window_view(b, w)
+        ac = aw - aw.mean(axis=1, keepdims=True)
+        bc = bw - bw.mean(axis=1, keepdims=True)
+        ss_a = (ac ** 2).sum(axis=1)
+        ss_b = (bc ** 2).sum(axis=1)
+        denom = np.sqrt(ss_a * ss_b)
+        corr  = np.where(denom > 1e-10, (ac * bc).sum(axis=1) / denom, 0.0)
+        out[w - 1:, j] = corr
+    return out
+
+
+def _compute_synchrony_features(Xa_imp: np.ndarray, Xb_imp: np.ndarray,
+                                  feat_cols: list, windows: tuple) -> tuple:
+    """
+    Compute dyadic synchrony features from median-imputed A and B matrices.
+
+    Features computed:
+      - |A - B|              (abs difference per feature)
+      - |z_A - z_B|          (z-score distance per feature)
+      - A * B                (feature product)
+      - cos_sim(A_vec, B_vec) (cosine similarity, scalar per timestep)
+      - rolling Pearson corr  (per feature per window)
+
+    Returns (X_sync, sync_names): (n, n_sync_features), list[str].
+    """
+    def _zscore(X: np.ndarray) -> np.ndarray:
+        mu = X.mean(axis=0)
+        sd = X.std(axis=0)
+        return (X - mu) / np.where(sd < 1e-8, 1.0, sd)
+
+    Za = _zscore(Xa_imp)
+    Zb = _zscore(Xb_imp)
+
+    abs_diff = np.abs(Xa_imp - Xb_imp)
+    z_dist   = np.abs(Za - Zb)
+    prod     = Xa_imp * Xb_imp
+
+    norms_a  = np.linalg.norm(Xa_imp, axis=1) + 1e-8
+    norms_b  = np.linalg.norm(Xb_imp, axis=1) + 1e-8
+    cos_sim  = ((Xa_imp * Xb_imp).sum(axis=1) / (norms_a * norms_b)).reshape(-1, 1)
+
+    roll_parts, roll_names = [], []
+    for w in windows:
+        rc = _rolling_corr(Za, Zb, w)
+        roll_parts.append(rc)
+        w_sec = w * 5
+        roll_names.extend([f"rollcorr_w{w_sec}s_{c}" for c in feat_cols])
+
+    X_sync = np.hstack([abs_diff, z_dist, prod, cos_sim] + roll_parts)
+    names  = (
+        [f"absdiff_{c}" for c in feat_cols] +
+        [f"zdist_{c}"   for c in feat_cols] +
+        [f"prod_{c}"    for c in feat_cols] +
+        ["cos_sim"]                          +
+        roll_names
+    )
+    return X_sync, names
 
 
 def _feature_cols(df: pd.DataFrame) -> list[str]:
@@ -501,6 +588,250 @@ def make_incremental_pairs(
                         "y":             y_use,
                         "feature_names": feat_names,
                     })
+    return records
+
+
+def make_synchrony_pairs(
+    seg_tables: dict[int, pd.DataFrame],
+    dyads: list[tuple[int, int]],
+    windows: tuple = (3, 6, 12),
+    lags: tuple = (0, 1),
+) -> list[dict]:
+    """
+    Dyadic synchrony features as predictors for cross-person affect.
+
+    Features: |A-B|, |z_A-z_B|, A*B, cosine similarity, rolling correlation.
+    Both role directions are built. condition = "sync_lag_{k}".
+
+    These features capture the RELATIONSHIP between A and B, not just B's raw state.
+    Key test: CCC(sync) vs CCC(lag_0) — does synchrony add beyond raw partner features?
+    """
+    records = []
+    min_len = max(windows, default=3) + 5
+
+    for session_idx, (pid_a, pid_b) in enumerate(dyads, start=1):
+        if pid_a not in seg_tables or pid_b not in seg_tables:
+            continue
+        df_a = seg_tables[pid_a]
+        df_b = seg_tables[pid_b]
+        common = sorted(set(df_a["seconds"]) & set(df_b["seconds"]))
+        if len(common) < min_len:
+            continue
+        da = df_a.set_index("seconds").loc[common]
+        db = df_b.set_index("seconds").loc[common]
+        feat_cols = _feature_cols(da.reset_index())
+
+        Xa_imp = _impute_cols(da[feat_cols].values.astype(float))
+        Xb_imp = _impute_cols(db[feat_cols].values.astype(float))
+        X_sync, sync_names = _compute_synchrony_features(Xa_imp, Xb_imp, feat_cols, windows)
+
+        # Synchrony is symmetric — both participants share the same sync features
+        for listener_df, p_l, p_s in [
+            (da, pid_a, pid_b),
+            (db, pid_b, pid_a),
+        ]:
+            for target in TARGETS:
+                y = listener_df[target].values.astype(float)
+                for lag in lags:
+                    cond_name = f"sync_lag_{lag}"
+                    if lag == 0:
+                        X_lag, y_lag = X_sync, y
+                    else:
+                        X_lag, y_lag = X_sync[:-lag], y[lag:]
+                    valid = ~np.isnan(y_lag)
+                    x_use, y_use = X_lag[valid], y_lag[valid]
+                    if len(y_use) < 5:
+                        continue
+                    records.append({
+                        "session_id":    session_idx,
+                        "pid_A":         p_l,
+                        "pid_B":         p_s,
+                        "target":        target,
+                        "condition":     cond_name,
+                        "X":             x_use,
+                        "y":             y_use,
+                        "feature_names": sync_names,
+                    })
+    return records
+
+
+def make_synchrony_augmented_pairs(
+    seg_tables: dict[int, pd.DataFrame],
+    dyads: list[tuple[int, int]],
+    windows: tuple = (3, 6, 12),
+    lags: tuple = (0,),
+) -> list[dict]:
+    """
+    Raw partner features + synchrony features (M4 in the synchrony ladder).
+
+    Compared against make_pairs (M3 = raw partner features only).
+    Key test: ΔCCC(sync_aug_lag_0 − lag_0) = added value of synchrony features.
+    condition = "sync_aug_lag_{k}"
+    """
+    records = []
+    min_len = max(windows, default=3) + 5
+
+    for session_idx, (pid_a, pid_b) in enumerate(dyads, start=1):
+        if pid_a not in seg_tables or pid_b not in seg_tables:
+            continue
+        df_a = seg_tables[pid_a]
+        df_b = seg_tables[pid_b]
+        common = sorted(set(df_a["seconds"]) & set(df_b["seconds"]))
+        if len(common) < min_len:
+            continue
+        da = df_a.set_index("seconds").loc[common]
+        db = df_b.set_index("seconds").loc[common]
+        feat_cols = _feature_cols(da.reset_index())
+
+        Xa_imp = _impute_cols(da[feat_cols].values.astype(float))
+        Xb_imp = _impute_cols(db[feat_cols].values.astype(float))
+        X_sync, sync_names = _compute_synchrony_features(Xa_imp, Xb_imp, feat_cols, windows)
+
+        for listener_df, speaker_imp, p_l, p_s in [
+            (da, Xb_imp, pid_a, pid_b),
+            (db, Xa_imp, pid_b, pid_a),
+        ]:
+            raw_names = [f"partner_{c}" for c in feat_cols]
+            X_aug     = np.hstack([speaker_imp, X_sync])
+            aug_names = raw_names + sync_names
+
+            for target in TARGETS:
+                y = listener_df[target].values.astype(float)
+                for lag in lags:
+                    cond_name = f"sync_aug_lag_{lag}"
+                    if lag == 0:
+                        X_lag, y_lag = X_aug, y
+                    else:
+                        X_lag, y_lag = X_aug[:-lag], y[lag:]
+                    valid = ~np.isnan(y_lag)
+                    x_use, y_use = X_lag[valid], y_lag[valid]
+                    if len(y_use) < 5:
+                        continue
+                    records.append({
+                        "session_id":    session_idx,
+                        "pid_A":         p_l,
+                        "pid_B":         p_s,
+                        "target":        target,
+                        "condition":     cond_name,
+                        "X":             x_use,
+                        "y":             y_use,
+                        "feature_names": aug_names,
+                    })
+    return records
+
+
+def make_random_synchrony_pairs(
+    seg_tables: dict[int, pd.DataFrame],
+    dyads: list[tuple[int, int]],
+    windows: tuple = (3, 6, 12),
+    seed: int = 42,
+) -> list[dict]:
+    """
+    Synchrony control: compute synchrony between A and a random non-partner.
+    If real-dyad synchrony > this, the result is specific to the actual pair.
+    condition = "sync_rnd"
+    """
+    rng = np.random.default_rng(seed)
+    pids = [p for dyad in dyads for p in dyad if p in seg_tables]
+    records = []
+    min_len = max(windows, default=3) + 5
+
+    for session_idx, (pid_a, pid_b) in enumerate(dyads, start=1):
+        for self_pid, partner_pid in [(pid_a, pid_b), (pid_b, pid_a)]:
+            if self_pid not in seg_tables:
+                continue
+            others = [p for p in pids if p != self_pid and p != partner_pid]
+            if not others:
+                continue
+            rand_pid = int(rng.choice(others))
+            if rand_pid not in seg_tables:
+                continue
+            df_self = seg_tables[self_pid]
+            df_rand = seg_tables[rand_pid]
+            common  = sorted(set(df_self["seconds"]) & set(df_rand["seconds"]))
+            if len(common) < min_len:
+                continue
+            da = df_self.set_index("seconds").loc[common]
+            db = df_rand.set_index("seconds").loc[common]
+            feat_cols = _feature_cols(da.reset_index())
+
+            Xa_imp = _impute_cols(da[feat_cols].values.astype(float))
+            Xb_imp = _impute_cols(db[feat_cols].values.astype(float))
+            X_sync, sync_names = _compute_synchrony_features(Xa_imp, Xb_imp, feat_cols, windows)
+
+            for target in TARGETS:
+                y = da[target].values.astype(float)
+                valid = ~np.isnan(y)
+                x_use, y_use = X_sync[valid], y[valid]
+                if len(y_use) < 5:
+                    continue
+                records.append({
+                    "session_id":    session_idx,
+                    "pid_A":         self_pid,
+                    "pid_B":         rand_pid,
+                    "target":        target,
+                    "condition":     "sync_rnd",
+                    "X":             x_use,
+                    "y":             y_use,
+                    "feature_names": sync_names,
+                })
+    return records
+
+
+def make_circular_shift_synchrony_pairs(
+    seg_tables: dict[int, pd.DataFrame],
+    dyads: list[tuple[int, int]],
+    windows: tuple = (3, 6, 12),
+    min_shift: int = 6,
+    seed: int = 42,
+) -> list[dict]:
+    """
+    Synchrony control: compute synchrony after circularly shifting partner features ≥30s.
+    Preserves signal distribution but destroys real-time interpersonal coupling.
+    condition = "sync_circ"
+    """
+    rng = np.random.default_rng(seed)
+    records = []
+    min_len = max(windows, default=3) + min_shift + 5
+
+    for session_idx, (pid_a, pid_b) in enumerate(dyads, start=1):
+        if pid_a not in seg_tables or pid_b not in seg_tables:
+            continue
+        df_a = seg_tables[pid_a]
+        df_b = seg_tables[pid_b]
+        common = sorted(set(df_a["seconds"]) & set(df_b["seconds"]))
+        if len(common) < min_len:
+            continue
+        da = df_a.set_index("seconds").loc[common]
+        db = df_b.set_index("seconds").loc[common]
+        feat_cols = _feature_cols(da.reset_index())
+
+        Xa_imp = _impute_cols(da[feat_cols].values.astype(float))
+        Xb_imp = _impute_cols(db[feat_cols].values.astype(float))
+        n = len(Xa_imp)
+        shift = int(rng.integers(min_shift, max(min_shift + 1, n // 2)))
+
+        for listener_df, listener_imp, speaker_imp, p_l, p_s in [
+            (da, Xa_imp, np.roll(Xb_imp, shift, axis=0), pid_a, pid_b),
+            (db, Xb_imp, np.roll(Xa_imp, shift, axis=0), pid_b, pid_a),
+        ]:
+            X_sync, sync_names = _compute_synchrony_features(listener_imp, speaker_imp, feat_cols, windows)
+            for target in TARGETS:
+                y = listener_df[target].values.astype(float)
+                valid = ~np.isnan(y)
+                x_use, y_use = X_sync[valid], y[valid]
+                if len(y_use) < 5:
+                    continue
+                records.append({
+                    "session_id":    session_idx,
+                    "pid_A":         p_l,
+                    "pid_B":         p_s,
+                    "target":        target,
+                    "condition":     "sync_circ",
+                    "X":             x_use,
+                    "y":             y_use,
+                    "feature_names": sync_names,
+                })
     return records
 
 

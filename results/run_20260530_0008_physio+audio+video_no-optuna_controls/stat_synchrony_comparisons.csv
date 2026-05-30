@@ -1,0 +1,5 @@
+model,target,cond_a,cond_b,median_delta,wilcoxon_p,signflip_p,n_sessions,comparison,wilcoxon_p_fdr
+CatBoost,arousal,sync_lag_0,sync_rnd,-0.009065067185231986,0.71905517578125,0.7775222477752225,16,sync_lag_0 vs sync_rnd,0.987518310546875
+CatBoost,arousal,sync_lag_0,sync_circ,-0.012937404499909464,0.987518310546875,0.9428057194280572,16,sync_lag_0 vs sync_circ,0.987518310546875
+CatBoost,valence,sync_lag_0,sync_rnd,0.0,0.36494545421034735,0.3243675632436756,16,sync_lag_0 vs sync_rnd,0.987518310546875
+CatBoost,valence,sync_lag_0,sync_circ,-0.0018036561224632833,0.8640261880026323,0.8537146285371463,16,sync_lag_0 vs sync_circ,0.987518310546875

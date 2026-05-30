@@ -20,9 +20,12 @@ import video_features as vid
 from dataset import (make_pairs, make_own_signal_pairs, make_random_dyad_pairs,
                      make_circular_shift_pairs, make_label_ar_pairs,
                      make_label_delta_pairs, make_missingness_pairs,
-                     make_incremental_pairs)
+                     make_incremental_pairs,
+                     make_synchrony_pairs, make_synchrony_augmented_pairs,
+                     make_random_synchrony_pairs, make_circular_shift_synchrony_pairs)
 from train import run_loso, summarise
-from evaluate import annotation_agreement, compare_conditions
+from evaluate import (annotation_agreement, compare_conditions, compare_models,
+                      fdr_correction, bootstrap_ci)
 from data_quality import print_quality_report, usable_dyads, nan_fraction_per_session
 import plots
 
@@ -172,6 +175,8 @@ def parse_args():
                         help="Skip label-delta (ΔA_label) target analysis")
     parser.add_argument("--no-agreement",  action="store_true",
                         help="Skip annotation agreement analysis")
+    parser.add_argument("--no-synchrony",  action="store_true",
+                        help="Skip synchrony feature analysis")
     return parser.parse_args()
 
 def make_run_dir(args) -> Path:
@@ -332,7 +337,7 @@ def main():
     print("\n[5/5] Cross-person prediction — PRIMARY (external observer) …")
     pairs_ext = make_pairs(seg_tables, good_dyads)
     pairs_ext += make_pairs(seg_tables_400ms, good_dyads,
-                             conditions=[(0, "lag_400ms")])
+                             conditions=[(0, "lag_400ms_av")])
 
     if not args.no_controls:
         print("  Adding negative-control pairs …")
@@ -424,7 +429,7 @@ def main():
     summary_incr = None
     if not args.no_incremental:
         print("\n--- Incremental Model Comparison (M1→M4) ---")
-        print("  Key: ΔCCC(M4 − M2) = added value of partner physio")
+        print("  Key: ΔCCC(M4 − M2) = added value of partner multimodal features")
         pairs_incr = make_incremental_pairs(seg_tables, good_dyads)
         if pairs_incr:
             # Fast-only: skip Optuna for incremental
@@ -444,27 +449,37 @@ def main():
         else:
             print("  [SKIP] no incremental pairs built")
 
-    # ── 8. Modality ablation ───────────────────────────────────────────────
+    # ── 8. Synchrony feature analysis ─────────────────────────────────────
+    summary_sync = None
+    if not args.no_synchrony:
+        print("\n--- Synchrony Feature Analysis ---")
+        print("  Dyadic coupling features: |A-B|, z-score dist, product, cos-sim, rolling corr")
+        summary_sync = _run_synchrony_analysis(seg_tables, good_dyads, OUT_DIR)
+
+    # ── 8b. Modality ablation ──────────────────────────────────────────────
     if args.ablation:
         print("\n--- Modality Ablation ---")
         _run_ablation(subjects, good_dyads, OUT_DIR)
 
     # ── 9. Plots ───────────────────────────────────────────────────────────
-    # Flatten agreement dfs for plots: {label: {pair_name: df}} → {pair_name: df}
     ag_for_plots = None
     if agreement_dfs:
-        # Use arousal agreement for the combined plot (or pick first target)
         ag_for_plots = agreement_dfs.get(TARGETS[0], None)
+
+    stat_model_df, stat_lag_df, stat_ctrl_df = _build_stat_tables(results_ext, OUT_DIR)
 
     plots.generate_all(results_ext, summary_ext, OUT_DIR, summary_par,
                        agreement_dfs=ag_for_plots,
-                       summary_incremental=summary_incr)
+                       summary_incremental=summary_incr,
+                       summary_sync=summary_sync,
+                       stat_model_df=stat_model_df,
+                       stat_lag_df=stat_lag_df,
+                       stat_ctrl_df=stat_ctrl_df)
     if summary_par is not None:
         plots.plot_ccc_comparison(summary_par, tag="partner")
     if summary_self is not None:
         plots.plot_ccc_comparison(summary_self, tag="self")
 
-    # Full agreement plots per target
     if agreement_dfs:
         for target in TARGETS:
             plots.plot_annotation_agreement(agreement_dfs[target], target)
@@ -489,37 +504,160 @@ def _run_annotation_perspective(seg_tables_persp, good_dyads, tag, out_dir):
     summary.to_csv(out_dir / f"loso_summary_{tag}.csv", index=False)
     return summary
 
+def _pick_ref_model(results_df) -> str:
+    """Select the best available reference model for statistical tests."""
+    for candidate in ["CatBoostOptuna", "CatBoost", "RidgeCV"]:
+        if candidate in results_df["model"].values:
+            return candidate
+    return results_df["model"].unique()[0]
+
+
 def _run_permutation_tests(results_df, summary_df):
     """
-    For each (target, model): test real partner (lag_0) > label_ar_own.
-    Uses both Wilcoxon signed-rank and sign-flip permutation tests.
-    Prints a compact table.
+    Comprehensive statistical tests:
+      1. Control comparisons: ref_model lag_0 vs each baseline condition
+      2. Lag comparisons:     ref_model lag_k vs lag_0 (FDR-corrected)
+      3. Model comparisons:   ref_model vs RidgeCV on lag_0 (FDR-corrected)
+
+    Prints compact tables for each family; saves permutation_tests.csv.
     """
-    baselines = ["label_ar_own", "random_dyad", "circ_shift", "own_signal"]
-    baselines = [b for b in baselines if b in results_df["condition"].values]
-    if not baselines:
-        print("  (no baseline conditions available for permutation tests)")
-        return
+    ref_model = _pick_ref_model(results_df)
+    print(f"  Reference model for tests: {ref_model}")
 
-    best_model = "CatBoost"
-    if best_model not in results_df["model"].values:
-        best_model = results_df["model"].unique()[0]
+    all_rows = []
 
-    rows = []
+    # ── Family A: control comparisons ────────────────────────────────────
+    ctrl_baselines = ["label_ar_own", "label_ar_partner", "label_ar_combined",
+                      "random_dyad", "circ_shift", "own_signal", "missingness"]
+    ctrl_baselines = [b for b in ctrl_baselines if b in results_df["condition"].values]
+    ctrl_rows = []
     for target in TARGETS:
-        for baseline in baselines:
-            res = compare_conditions(results_df, best_model, target, "lag_0", baseline)
-            rows.append(res)
+        for baseline in ctrl_baselines:
+            row = compare_conditions(results_df, ref_model, target, "lag_0", baseline)
+            row["family"] = "control"
+            row["comparison"] = f"lag_0 vs {baseline}"
+            ctrl_rows.append(row)
+    if ctrl_rows:
+        ctrl_df = pd.DataFrame(ctrl_rows)
+        ps = fdr_correction(ctrl_df["wilcoxon_p"].fillna(1.0).tolist())
+        ctrl_df["wilcoxon_p_fdr"] = ps
+        ps_sf = fdr_correction(ctrl_df["signflip_p"].fillna(1.0).tolist())
+        ctrl_df["signflip_p_fdr"] = ps_sf
+        print("\n  A) Control comparisons (ref model: lag_0 vs baseline):")
+        print(ctrl_df[["target", "cond_b", "median_delta",
+                        "wilcoxon_p", "wilcoxon_p_fdr"]].to_string(index=False))
+        all_rows.append(ctrl_df)
 
-    df = pd.DataFrame(rows)
-    print(df[["target", "cond_b", "median_delta",
-              "wilcoxon_p", "signflip_p"]].to_string(index=False))
-    df.to_csv(OUT_DIR / "permutation_tests.csv", index=False)
-    print("  (Wilcoxon / sign-flip one-sided H1: lag_0 > baseline)")
+    # ── Family B: lag comparisons ─────────────────────────────────────────
+    lag_conds = [c for c in ["lag_400ms_av", "lag_1", "lag_2", "lag_3", "lag_4"]
+                 if c in results_df["condition"].values]
+    lag_rows = []
+    for target in TARGETS:
+        for lag_cond in lag_conds:
+            row = compare_conditions(results_df, ref_model, target, lag_cond, "lag_0")
+            row["family"] = "lag"
+            row["comparison"] = f"{lag_cond} vs lag_0"
+            lag_rows.append(row)
+    if lag_rows:
+        lag_df = pd.DataFrame(lag_rows)
+        ps = fdr_correction(lag_df["wilcoxon_p"].fillna(1.0).tolist())
+        lag_df["wilcoxon_p_fdr"] = ps
+        ps_sf = fdr_correction(lag_df["signflip_p"].fillna(1.0).tolist())
+        lag_df["signflip_p_fdr"] = ps_sf
+        print(f"\n  B) Lag comparisons ({ref_model}, FDR-corrected):")
+        print(lag_df[["target", "cond_a", "median_delta",
+                       "wilcoxon_p", "wilcoxon_p_fdr"]].to_string(index=False))
+        all_rows.append(lag_df)
+
+    # ── Family C: model comparisons ───────────────────────────────────────
+    comparison_models = [m for m in ["CatBoostOptuna", "CatBoost", "Ensemble", "RidgeCV"]
+                         if m in results_df["model"].values and m != ref_model]
+    model_rows = []
+    for target in TARGETS:
+        for other_model in comparison_models:
+            row = compare_models(results_df, target, "lag_0", ref_model, other_model)
+            row["family"] = "model"
+            model_rows.append(row)
+    if model_rows:
+        model_df = pd.DataFrame(model_rows)
+        ps = fdr_correction(model_df["wilcoxon_p"].fillna(1.0).tolist())
+        model_df["wilcoxon_p_fdr"] = ps
+        ps_sf = fdr_correction(model_df["signflip_p"].fillna(1.0).tolist())
+        model_df["signflip_p_fdr"] = ps_sf
+        print(f"\n  C) Model comparisons (lag_0, {ref_model} vs others, FDR-corrected):")
+        print(model_df[["target", "comparison", "median_delta",
+                         "wilcoxon_p", "wilcoxon_p_fdr",
+                         "boot_ci_lo", "boot_ci_hi"]].to_string(index=False))
+        all_rows.append(model_df)
+
+    if all_rows:
+        combined = pd.concat(all_rows, ignore_index=True)
+        combined.to_csv(OUT_DIR / "permutation_tests.csv", index=False)
+        print("\n  (One-sided H1: condition_A > condition_B; FDR via Benjamini-Hochberg)")
+        print(f"  Saved: permutation_tests.csv")
+
+
+def _build_stat_tables(results_df, out_dir) -> tuple:
+    """Build separate stat tables for model/lag/control comparisons for plotting."""
+    ref_model = _pick_ref_model(results_df)
+
+    # Model comparison table
+    model_rows = []
+    comp_models = [m for m in ["CatBoostOptuna", "CatBoost", "Ensemble", "SVR", "RidgeCV"]
+                   if m in results_df["model"].values and m != ref_model]
+    for target in TARGETS:
+        for other in comp_models:
+            row = compare_models(results_df, target, "lag_0", ref_model, other)
+            row["family"] = "model"
+            model_rows.append(row)
+    stat_model = None
+    if model_rows:
+        stat_model = pd.DataFrame(model_rows)
+        ps = fdr_correction(stat_model["wilcoxon_p"].fillna(1.0).tolist())
+        stat_model["wilcoxon_p_fdr"] = ps
+        stat_model.to_csv(out_dir / "stat_model_comparisons.csv", index=False)
+
+    # Lag comparison table
+    lag_conds = [c for c in ["lag_400ms_av", "lag_1", "lag_2", "lag_3", "lag_4"]
+                 if c in results_df["condition"].values]
+    lag_rows = []
+    for target in TARGETS:
+        for lag_cond in lag_conds:
+            row = compare_conditions(results_df, ref_model, target, lag_cond, "lag_0")
+            row["comparison"] = f"{lag_cond} vs lag_0"
+            row["family"] = "lag"
+            lag_rows.append(row)
+    stat_lag = None
+    if lag_rows:
+        stat_lag = pd.DataFrame(lag_rows)
+        ps = fdr_correction(stat_lag["wilcoxon_p"].fillna(1.0).tolist())
+        stat_lag["wilcoxon_p_fdr"] = ps
+        stat_lag.to_csv(out_dir / "stat_lag_comparisons.csv", index=False)
+
+    # Control comparison table
+    ctrl_baselines = ["label_ar_own", "label_ar_combined", "random_dyad", "circ_shift",
+                      "own_signal", "missingness"]
+    ctrl_baselines = [b for b in ctrl_baselines if b in results_df["condition"].values]
+    ctrl_rows = []
+    for target in TARGETS:
+        for baseline in ctrl_baselines:
+            row = compare_conditions(results_df, ref_model, target, "lag_0", baseline)
+            row["comparison"] = f"lag_0 vs {baseline}"
+            row["family"] = "control"
+            ctrl_rows.append(row)
+    stat_ctrl = None
+    if ctrl_rows:
+        stat_ctrl = pd.DataFrame(ctrl_rows)
+        ps = fdr_correction(stat_ctrl["wilcoxon_p"].fillna(1.0).tolist())
+        stat_ctrl["wilcoxon_p_fdr"] = ps
+        stat_ctrl.to_csv(out_dir / "stat_control_comparisons.csv", index=False)
+
+    return stat_model, stat_lag, stat_ctrl
 
 def _print_incremental_delta(summary):
     """Print ΔCCC table for M1→M4."""
-    print("\n  Model  Target  M1→M2 (own physio)  M2→M3 (partner labels)  M2→M4 (partner physio)")
+    print("\n  Model      Target    Δ(M2−M1) own signal  Δ(M3−M1) partner labels  "
+          "Δ(M4−M2) partner features")
     for target in TARGETS:
         sub = summary[summary["target"] == target]
         for model in ["RidgeCV", "CatBoost"]:
@@ -536,6 +674,77 @@ def _print_incremental_delta(summary):
                   f"Δ(M3−M1)={m3-m1:+.4f}  "
                   f"Δ(M4−M2)={m4-m2:+.4f}  "
                   f"[M4={m4:.4f}]")
+
+def _run_synchrony_analysis(seg_tables, good_dyads, out_dir) -> pd.DataFrame:
+    """
+    Synchrony extension: test whether dyadic coupling features predict affect
+    beyond raw partner features.
+
+    Conditions produced:
+      sync_lag_0 / sync_lag_1   — pure synchrony features
+      sync_aug_lag_0            — raw partner + synchrony (M4)
+      sync_rnd                  — random-dyad synchrony control
+      sync_circ                 — circular-shift synchrony control
+
+    Key test: sync_aug_lag_0 (M4) vs lag_0 (M3, from primary analysis).
+    """
+    import models as _mods
+    from config import SYNCHRONY_WINDOWS
+
+    # Fast models only: synchrony features are high-dimensional
+    _orig_all = _mods.all_models
+    _mods.all_models = lambda: [m for m in _orig_all()
+                                 if m.name in ("MeanBaseline", "RidgeCV", "CatBoost")]
+
+    pairs_sync = make_synchrony_pairs(seg_tables, good_dyads,
+                                       windows=SYNCHRONY_WINDOWS, lags=(0, 1))
+    pairs_sync_aug = make_synchrony_augmented_pairs(seg_tables, good_dyads,
+                                                     windows=SYNCHRONY_WINDOWS, lags=(0,))
+    pairs_sync_rnd = make_random_synchrony_pairs(seg_tables, good_dyads,
+                                                  windows=SYNCHRONY_WINDOWS)
+    pairs_sync_circ = make_circular_shift_synchrony_pairs(seg_tables, good_dyads,
+                                                            windows=SYNCHRONY_WINDOWS)
+    all_sync_pairs = pairs_sync + pairs_sync_aug + pairs_sync_rnd + pairs_sync_circ
+
+    if not all_sync_pairs:
+        print("  [SKIP] no synchrony pairs built")
+        _mods.all_models = _orig_all
+        return None
+
+    _print_pair_summary(all_sync_pairs)
+    print("\nRunning LOSO CV (synchrony) …")
+    results_sync = run_loso(all_sync_pairs)
+    summary_sync = summarise(results_sync)
+
+    print("\n=== Synchrony Results ===")
+    print(summary_sync.to_string(index=False))
+
+    # Key test: sync_aug_lag_0 vs lag_0 (from primary results — not available here)
+    # Print what we have: sync vs sync controls
+    print("\n  Synchrony control tests (sync_lag_0 vs sync_rnd, sync_circ):")
+    ref_model = _pick_ref_model(results_sync)
+    sync_rows = []
+    for target in TARGETS:
+        for ctrl in ["sync_rnd", "sync_circ"]:
+            if ctrl in results_sync["condition"].values:
+                row = compare_conditions(results_sync, ref_model, target, "sync_lag_0", ctrl)
+                row["comparison"] = f"sync_lag_0 vs {ctrl}"
+                sync_rows.append(row)
+    if sync_rows:
+        sync_stat = pd.DataFrame(sync_rows)
+        ps = fdr_correction(sync_stat["wilcoxon_p"].fillna(1.0).tolist())
+        sync_stat["wilcoxon_p_fdr"] = ps
+        print(sync_stat[["target", "comparison", "median_delta",
+                          "wilcoxon_p", "wilcoxon_p_fdr"]].to_string(index=False))
+        sync_stat.to_csv(out_dir / "stat_synchrony_comparisons.csv", index=False)
+
+    results_sync.to_csv(out_dir / "loso_results_synchrony.csv", index=False)
+    summary_sync.to_csv(out_dir / "loso_summary_synchrony.csv", index=False)
+    print(f"  Synchrony results saved → {out_dir}/")
+
+    _mods.all_models = _orig_all
+    return summary_sync
+
 
 def _run_ablation(subjects, good_dyads, out_dir):
     """Run LOSO for each modality subset and save results."""

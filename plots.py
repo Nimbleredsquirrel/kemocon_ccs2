@@ -176,7 +176,7 @@ def plot_secondary_analysis(summary_ext: pd.DataFrame,
     conds_available = sorted(set(summary_ext["condition"].unique()) &
                               set(summary_par["condition"].unique()))
     # Only show lag_0 and lag_1 to keep the plot readable
-    conds = [c for c in ["lag_0", "lag_1", "lag_400ms"] if c in conds_available]
+    conds = [c for c in ["lag_0", "lag_1", "lag_400ms_av"] if c in conds_available]
     if not conds:
         conds = conds_available[:2]
 
@@ -333,7 +333,7 @@ def plot_incremental(summary: "pd.DataFrame", target: str) -> None:
         ax.set_ylabel("Mean CCC ± 95% CI")
 
     fig.suptitle(f"Incremental Model Comparison — {target}\n"
-                 "M4−M2 = added value of partner physio", fontsize=11)
+                 "M4−M2 = added value of partner multimodal features", fontsize=11)
     plt.tight_layout()
     path = FIG_DIR / f"incremental_{target}.png"
     fig.savefig(path, dpi=150)
@@ -376,6 +376,148 @@ def plot_ablation(ablation_summaries: dict, results_dir: Path) -> None:
     plt.close(fig)
     print(f"  Saved: {path.name}")
 
+def plot_per_session_ccc_bar(results_df: pd.DataFrame, target: str,
+                              condition: str = "lag_0",
+                              model: str = None) -> None:
+    """
+    Bar chart of per-session CCC for a given model and condition.
+    Sorted by CCC to reveal session heterogeneity.
+    """
+    sub = results_df[(results_df["target"] == target) &
+                     (results_df["condition"] == condition)]
+    if sub.empty:
+        return
+    if model is None:
+        # Pick the model with the highest mean CCC
+        model = sub.groupby("model")["ccc"].mean().idxmax()
+    sub_m = sub[sub["model"] == model].sort_values("ccc")
+    if sub_m.empty:
+        return
+
+    sessions = sub_m["held_out_session"].values
+    ccc_vals = sub_m["ccc"].values
+    colors = ["#4C72B0" if v >= 0 else "#C44E52" for v in ccc_vals]
+
+    fig, ax = plt.subplots(figsize=(max(8, len(sessions) * 0.5), 4))
+    ax.bar(range(len(sessions)), ccc_vals, color=colors, alpha=0.85)
+    ax.axhline(0, color="black", linewidth=0.9, linestyle="--")
+    ax.set_xticks(range(len(sessions)))
+    ax.set_xticklabels([f"S{s}" for s in sessions], fontsize=8)
+    ax.set_ylabel("CCC")
+    ax.set_title(f"Per-Session CCC — {model} | {target} | {condition}", fontsize=11)
+    ax.set_xlabel("Session (sorted by CCC)")
+    plt.tight_layout()
+    path = FIG_DIR / f"per_session_ccc_bar_{target}_{condition}_{model}.png"
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"  Saved: {path.name}")
+
+
+def plot_stat_table(stat_df: pd.DataFrame, title: str, tag: str = "") -> None:
+    """
+    Heatmap of Wilcoxon p-values (FDR-corrected) from a statistical comparison table.
+    Rows = target, columns = comparison. Green = significant (p < 0.05).
+    """
+    if stat_df is None or stat_df.empty:
+        return
+    needed = {"target", "wilcoxon_p_fdr", "comparison"}
+    if not needed.issubset(stat_df.columns):
+        return
+
+    targets = sorted(stat_df["target"].unique())
+    comparisons = stat_df["comparison"].unique().tolist()
+
+    matrix = np.full((len(targets), len(comparisons)), np.nan)
+    for i, t in enumerate(targets):
+        for j, c in enumerate(comparisons):
+            row = stat_df[(stat_df["target"] == t) & (stat_df["comparison"] == c)]
+            if len(row):
+                matrix[i, j] = float(row["wilcoxon_p_fdr"].values[0])
+
+    fig, ax = plt.subplots(figsize=(max(8, len(comparisons) * 1.5), max(3, len(targets) * 0.9)))
+    im = ax.imshow(matrix, aspect="auto", cmap="RdYlGn_r", vmin=0, vmax=0.15)
+    plt.colorbar(im, ax=ax, label="Wilcoxon p (FDR)", fraction=0.04)
+
+    for i in range(len(targets)):
+        for j in range(len(comparisons)):
+            val = matrix[i, j]
+            if np.isfinite(val):
+                sig = "**" if val < 0.01 else ("*" if val < 0.05 else "ns")
+                ax.text(j, i, f"{val:.3f}\n{sig}", ha="center", va="center",
+                        fontsize=8, color="black")
+
+    ax.set_xticks(range(len(comparisons)))
+    ax.set_xticklabels(comparisons, rotation=30, ha="right", fontsize=8)
+    ax.set_yticks(range(len(targets)))
+    ax.set_yticklabels(targets, fontsize=9)
+    ax.set_title(title, fontsize=11)
+    plt.tight_layout()
+    path = FIG_DIR / f"stat_table{'_' + tag if tag else ''}.png"
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"  Saved: {path.name}")
+
+
+def plot_synchrony_comparison(summary_sync: pd.DataFrame,
+                               summary_ext: pd.DataFrame) -> None:
+    """
+    Compare synchrony-only (sync_lag_0) and synchrony-augmented (sync_aug_lag_0)
+    against raw partner features (lag_0), per target.
+    """
+    targets = ["arousal", "valence"]
+    models  = [m for m in summary_ext["model"].unique() if m != "MeanBaseline"]
+    cond_map = {
+        "lag_0":          "Raw partner\n(M3)",
+        "sync_lag_0":     "Sync only",
+        "sync_aug_lag_0": "Partner + Sync\n(M4)",
+        "sync_rnd":       "Random-dyad\nsync",
+        "sync_circ":      "Circ-shift\nsync",
+    }
+    all_summary = pd.concat([summary_ext, summary_sync], ignore_index=True)
+
+    fig, axes = plt.subplots(1, len(targets), figsize=(6 * len(targets), 5), sharey=False)
+    if len(targets) == 1:
+        axes = [axes]
+
+    cmap = plt.cm.get_cmap("Set2", len(cond_map))
+    colors = {c: cmap(i) for i, c in enumerate(cond_map)}
+
+    for ax, target in zip(axes, targets):
+        sub = all_summary[all_summary["target"] == target]
+        x = np.arange(len(models))
+        n_conds = len(cond_map)
+        w = 0.8 / max(n_conds, 1)
+        for i, (cond, label) in enumerate(cond_map.items()):
+            vals, yerr_lo, yerr_hi = [], [], []
+            for m in models:
+                row = sub[(sub["model"] == m) & (sub["condition"] == cond)]
+                if len(row):
+                    mu   = float(row["ccc_mean"].values[0])
+                    ci_l = row["ccc_ci_lo"].values[0] if "ccc_ci_lo" in row.columns else mu
+                    ci_h = row["ccc_ci_hi"].values[0] if "ccc_ci_hi" in row.columns else mu
+                    vals.append(mu)
+                    yerr_lo.append(mu - ci_l)
+                    yerr_hi.append(ci_h - mu)
+                else:
+                    vals.append(0); yerr_lo.append(0); yerr_hi.append(0)
+            offset = (i - n_conds / 2 + 0.5) * w
+            ax.bar(x + offset, vals, w, yerr=[yerr_lo, yerr_hi], capsize=3,
+                   color=colors[cond], alpha=0.85, label=label)
+        ax.axhline(0, color="black", linewidth=0.8, linestyle="--")
+        ax.set_xticks(x)
+        ax.set_xticklabels(models, rotation=20, ha="right", fontsize=8)
+        ax.set_title(f"Synchrony vs Raw Partner Features — {target}", fontsize=11)
+        ax.set_ylabel("Mean CCC ± 95% CI")
+        ax.legend(fontsize=7, ncol=2)
+
+    fig.suptitle("Synchrony Extension: Do Dyadic Coupling Features Help?", fontsize=12)
+    plt.tight_layout()
+    path = FIG_DIR / "synchrony_comparison.png"
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"  Saved: {path.name}")
+
+
 def _pretty(col: str) -> str:
     return (col
         .replace("aud_F0semitoneFrom27.5Hz_sma3nz_amean", "F0 mean")
@@ -417,7 +559,11 @@ def generate_all(results_df: pd.DataFrame, summary: pd.DataFrame,
                  results_dir: Path,
                  summary_partner: pd.DataFrame = None,
                  agreement_dfs: dict = None,
-                 summary_incremental: pd.DataFrame = None) -> None:
+                 summary_incremental: pd.DataFrame = None,
+                 summary_sync: pd.DataFrame = None,
+                 stat_model_df: pd.DataFrame = None,
+                 stat_lag_df: pd.DataFrame = None,
+                 stat_ctrl_df: pd.DataFrame = None) -> None:
     """Generate all standard plots from a completed run."""
     FIG_DIR.mkdir(parents=True, exist_ok=True)
     print("\nGenerating plots …")
@@ -426,12 +572,12 @@ def generate_all(results_df: pd.DataFrame, summary: pd.DataFrame,
     plot_h2_delta(summary)
 
     for target in results_df["target"].unique():
-        for cond in ["lag_0", "lag_1", "lag_400ms"]:
+        for cond in ["lag_0", "lag_1", "lag_400ms_av"]:
             if cond in results_df["condition"].values:
                 plot_per_session_ccc(results_df, target, cond)
+                plot_per_session_ccc_bar(results_df, target, cond)
         imp_path = results_dir / f"feature_importance_{target}.json"
         plot_feature_importance(imp_path, target)
-        # Per-dyad heatmap for the main lag_0 condition
         plot_dyad_heatmap(results_df, target, "lag_0")
 
     if summary_partner is not None:
@@ -445,5 +591,15 @@ def generate_all(results_df: pd.DataFrame, summary: pd.DataFrame,
         for target in results_df["target"].unique():
             if target in summary_incremental["target"].values:
                 plot_incremental(summary_incremental, target)
+
+    if summary_sync is not None:
+        plot_synchrony_comparison(summary_sync, summary)
+
+    if stat_model_df is not None:
+        plot_stat_table(stat_model_df, "Model Comparisons (Wilcoxon FDR)", "model")
+    if stat_lag_df is not None:
+        plot_stat_table(stat_lag_df,   "Lag Comparisons vs lag_0 (Wilcoxon FDR)", "lag")
+    if stat_ctrl_df is not None:
+        plot_stat_table(stat_ctrl_df,  "Control Comparisons (Wilcoxon FDR)", "ctrl")
 
     print(f"All figures saved to {FIG_DIR}/")

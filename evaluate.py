@@ -118,6 +118,65 @@ def compare_conditions(results_df, model: str, target: str,
             "n_sessions":   wx["n"]}
 
 
+def fdr_correction(p_values: list) -> list:
+    """Benjamini-Hochberg FDR correction for a family of p-values."""
+    p = np.array(p_values, dtype=float)
+    n = len(p)
+    if n == 0:
+        return []
+    order = np.argsort(p)
+    ranks = np.empty(n, dtype=int)
+    ranks[order] = np.arange(1, n + 1)
+    p_adj = np.minimum(1.0, p * n / ranks)
+    # enforce monotonicity
+    for i in range(n - 2, -1, -1):
+        p_adj[order[i]] = min(p_adj[order[i]], p_adj[order[i + 1]])
+    return p_adj.tolist()
+
+
+def bootstrap_ci(a: np.ndarray, b: np.ndarray,
+                 n_boot: int = 5000, seed: int = 42,
+                 confidence: float = 0.95) -> tuple:
+    """Bootstrap CI on mean(a - b) per session."""
+    rng = np.random.default_rng(seed)
+    a = np.asarray([v for v in a if not np.isnan(v)], float)
+    b = np.asarray([v for v in b if not np.isnan(v)], float)
+    n = min(len(a), len(b))
+    if n < 2:
+        return np.nan, np.nan
+    diffs = a[:n] - b[:n]
+    boots = np.array([rng.choice(diffs, size=n, replace=True).mean()
+                      for _ in range(n_boot)])
+    alpha = (1 - confidence) / 2
+    return float(np.percentile(boots, alpha * 100)), float(np.percentile(boots, (1 - alpha) * 100))
+
+
+def compare_models(results_df, target: str, cond: str,
+                   model_a: str, model_b: str) -> dict:
+    """Per-session CCC paired comparison between two models on the same condition."""
+    def _cccs(model):
+        sub = results_df[(results_df["model"] == model) &
+                         (results_df["target"] == target) &
+                         (results_df["condition"] == cond)]
+        return sub.sort_values("held_out_session")["ccc"].values
+
+    a_vals = _cccs(model_a)
+    b_vals = _cccs(model_b)
+    wx = wilcoxon_test(a_vals, b_vals)
+    sf = sign_flip_test(a_vals, b_vals)
+    ci_lo, ci_hi = bootstrap_ci(a_vals, b_vals)
+    return {
+        "comparison":   f"{model_a} vs {model_b}",
+        "model_a":      model_a, "model_b": model_b,
+        "target":       target,  "condition": cond,
+        "median_delta": wx["median_delta"],
+        "wilcoxon_p":   wx["p_value"],
+        "signflip_p":   sf["p_value"],
+        "boot_ci_lo":   ci_lo,   "boot_ci_hi": ci_hi,
+        "n_sessions":   wx["n"],
+    }
+
+
 def annotation_agreement(
     seg_tables_a: dict,
     seg_tables_b: dict,

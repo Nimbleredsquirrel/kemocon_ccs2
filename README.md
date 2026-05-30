@@ -71,10 +71,10 @@ kemocon_baseline/
 ├── features.py             # physio feature extraction per 5s segment
 ├── audio_features.py       # eGeMAPS extraction via opensmile
 ├── video_features.py       # facial AU / head pose from frame-level CSVs
-├── dataset.py              # builds all (X, y) pair types
+├── dataset.py              # builds all (X, y) pair types (incl. synchrony)
 ├── models.py               # all ML models
 ├── train.py                # LOSO cross-validation loop
-├── evaluate.py             # metrics + statistical tests
+├── evaluate.py             # metrics + statistical tests (CCC, Wilcoxon, FDR, bootstrap CI)
 ├── data_quality.py         # NaN audit, usable-dyad selection
 ├── plots.py                # figures
 ├── extract_all.py          # one-time data extraction
@@ -97,12 +97,19 @@ kemocon_baseline/
         ├── config_snapshot.json
         ├── loso_results_primary.csv
         ├── loso_summary_primary.csv
-        ├── loso_results_partner.csv  (if run)
-        ├── loso_results_self.csv     (if run)
+        ├── loso_results_partner.csv
+        ├── loso_summary_partner.csv
+        ├── loso_results_self.csv
+        ├── loso_summary_self.csv
         ├── loso_results_incremental.csv
-        ├── loso_results_delta.csv
+        ├── loso_summary_incremental.csv
+        ├── loso_results_synchrony.csv      (unless --no-synchrony)
+        ├── loso_summary_synchrony.csv      (unless --no-synchrony)
         ├── permutation_tests.csv
-        ├── feature_importance_*.json
+        ├── stat_model_comparisons.csv
+        ├── stat_lag_comparisons.csv
+        ├── stat_control_comparisons.csv
+        ├── stat_synchrony_comparisons.csv  (unless --no-synchrony)
         └── figures/
 ```
 
@@ -144,7 +151,7 @@ AU04, AU06, AU12, AU17 intensity mean/std; head pitch/yaw mean/std.
 
 ### Delta features
 
-For every feature `f`, `delta_f = f[t] − f[t−1]` is appended, doubling the vector. This captures rate-of-change.
+For every feature `f`, `delta_f = f[t] − f[t−1]` is appended, doubling the vector. This captures rate-of-change. Enabled with `--delta` (off by default, slow).
 
 ---
 
@@ -157,7 +164,7 @@ For every feature `f`, `delta_f = f[t] − f[t−1]` is appended, doubling the v
 | Condition | Shift | Modality note |
 |-----------|-------|---------------|
 | `lag_0` | 0 — synchronous | all |
-| `lag_400ms` | −400 ms anticipatory | audio/video only; physio window unchanged |
+| `lag_400ms_av` | −400 ms anticipatory | audio/video only; physio window unchanged |
 | `lag_1` … `lag_4` | −5s … −20s (5s steps) | physio-scale lags |
 
 The 400ms shift is applied only to audio/video features (re-extracted with a 400ms window offset). Physiology operates at 5s resolution — a 400ms offset has no meaningful effect on HR/EDA/temperature and is not applied.
@@ -166,16 +173,19 @@ The 400ms shift is applied only to audio/video features (re-extracted with a 400
 
 | Function | Condition tag | Purpose |
 |----------|---------------|---------|
-| `make_pairs` | `lag_0` … `lag_4`, `lag_400ms` | Main cross-person pairs |
+| `make_pairs` | `lag_0` … `lag_4`, `lag_400ms_av` | Main cross-person pairs |
 | `make_own_signal_pairs` | `own_signal` | Predict A from A's own features |
 | `make_random_dyad_pairs` | `random_dyad` | A paired with random non-partner |
 | `make_circular_shift_pairs` | `circ_shift` | Partner features time-shifted ≥ 30s |
-| `make_label_ar_pairs` (mode=own) | `label_ar_own` | **A's own past labels only** |
+| `make_label_ar_pairs` (mode=own) | `label_ar_own` | A's own past labels only |
 | `make_label_ar_pairs` (mode=partner) | `label_ar_partner` | Partner's past labels |
 | `make_label_ar_pairs` (mode=combined) | `label_ar_combined` | Both past-label histories |
 | `make_missingness_pairs` | `missingness` | NaN-indicator features only (red-flag) |
-| `make_label_delta_pairs` | `lag_0_delta` | Predict ΔA_label[t] instead of levels |
 | `make_incremental_pairs` | `M1`–`M4` | Incremental feature ablation |
+| `make_synchrony_pairs` | `sync_lag_0`, `sync_lag_1` | Dyadic synchrony features only |
+| `make_synchrony_augmented_pairs` | `sync_aug_lag_0` | Own features + synchrony features |
+| `make_random_synchrony_pairs` | `sync_rnd` | Synchrony from random-dyad pairing |
+| `make_circular_shift_synchrony_pairs` | `sync_circ` | Synchrony from circular-shifted pairing |
 
 ---
 
@@ -191,6 +201,8 @@ The 400ms shift is applied only to audio/video features (re-extracted with a 400
 | `CatBoostOptuna` | Optuna inner 3-fold × 10 trials; uses GroupKFold by session |
 | `EnsembleModel` | Average of CatBoost + RidgeCV + SVR |
 
+Synchrony LOSO uses a reduced set (MeanBaseline, RidgeCV, CatBoost) for speed.
+
 ---
 
 ## Evaluation
@@ -203,16 +215,21 @@ Additional metrics reported per fold: Pearson r, RMSE, **pred_dispersion** (std_
 
 ### Statistical tests (`evaluate.py`)
 
-For each model × target, `lag_0` is compared to each control condition using:
+Three test families are run and FDR-corrected independently:
 
-- **Wilcoxon signed-rank test** on per-session CCC differences (one-sided H₁: real > control)
-- **Sign-flip permutation test** (10 000 random sign flips of session-level deltas)
+| Family | Comparisons | Tests |
+|--------|-------------|-------|
+| A — Control | `lag_0` vs each control condition | Wilcoxon signed-rank (one-sided) + sign-flip permutation (10 000 flips) |
+| B — Lag | `lag_1`–`lag_4`, `lag_400ms_av` vs `lag_0` | Same |
+| C — Model | CatBoost vs Ensemble/RidgeCV/SVR on `lag_0` | Same + bootstrap CI on mean Δ |
+
+**FDR correction:** Benjamini-Hochberg applied within each family separately. Raw and adjusted p-values saved in `stat_*.csv` files.
 
 Parametric t-tests are not used: with N=16 sessions, distribution assumptions are not reliable.
 
 ### Annotation agreement analysis
 
-Before trusting low model CCC, the pipeline reports Pearson r between annotation perspectives per participant:
+Before trusting low model CCC, the pipeline can report Pearson r between annotation perspectives per participant (enabled with `--agreement`):
 
 | Comparison | Interpretation |
 |-----------|----------------|
@@ -231,11 +248,29 @@ The key analysis to distinguish partner signal from emotional inertia:
 | Config | Features | Added vs previous |
 |--------|----------|-------------------|
 | M1 `own_label_ar` | A_label[t-1..t-4] | — |
-| M2 `own_signal` | M1 + A_physio[t] | own physio |
+| M2 `own_signal` | M1 + A_physio+audio+video[t] | own multimodal features |
 | M3 `label_coupling` | M1 + B_label[t-1..t-4] | partner labels |
-| M4 `full` | M2 + B_physio[t] | partner physio |
+| M4 `full` | M2 + B_physio+audio+video[t] | partner multimodal features |
 
-**ΔCCC(M4 − M2)** is the direct test of whether partner physiology adds anything beyond own emotional inertia and own physio. If this delta is near zero, the cross-person model adds nothing meaningful.
+**ΔCCC(M4 − M2)** is the direct test of whether partner features add anything beyond own emotional inertia and own multimodal features. If this delta is near zero, the cross-person model adds nothing meaningful.
+
+---
+
+## Synchrony Extension
+
+Beyond raw partner features, the pipeline also tests **dyadic synchrony features** computed from the listener–speaker feature pair:
+
+| Feature | Formula |
+|---------|---------|
+| Absolute difference | \|A − B\| per feature |
+| Z-score distance | \|z_A − z_B\| per feature |
+| Product | A × B per feature |
+| Cosine similarity | cos(A, B) scalar per timestep |
+| Rolling Pearson r | Per feature, windows of 15s / 30s / 60s (3/6/12 segments) |
+
+Window sizes are set by `SYNCHRONY_WINDOWS = (3, 6, 12)` in `config.py`. Rolling correlation uses `numpy.lib.stride_tricks.sliding_window_view` (vectorized, no Python loops over timesteps).
+
+Synchrony controls (`sync_rnd`, `sync_circ`) use the same feature computation but on randomly-paired or time-shifted dyads, allowing a direct test of whether true-dyad synchrony carries information beyond chance coupling.
 
 ---
 
@@ -249,10 +284,6 @@ LOSO is run independently for all three targets:
 | Secondary | Partner's perception | `loso_*_partner.csv` |
 | Tertiary | Self-report | `loso_*_self.csv` |
 
-The interesting result may be: partner physiology predicts *displayed* (external) affect slightly, but not *felt* (self) affect. That would be a precise, publishable claim.
-
-Label delta targets (`arousal_delta`, `valence_delta`) are also run to test whether partner features predict *changes* in affect rather than levels.
-
 ---
 
 ## CLI
@@ -261,20 +292,20 @@ Label delta targets (`arousal_delta`, `valence_delta`) are also run to test whet
 # Full run (physio + audio + video, all analyses)
 python3 main.py
 
-# Fast test run (skips CatBoostOptuna, much faster)
+# Fast run (skips CatBoostOptuna, much faster)
 python3 main.py --no-optuna
+
+# Skip synchrony LOSO (saves ~20-40 min)
+python3 main.py --no-optuna --no-synchrony
 
 # Physio features only
 python3 main.py --physio-only --no-optuna
 
 # Skip slow secondary analyses
-python3 main.py --no-optuna --no-incremental --no-delta
+python3 main.py --no-optuna --no-delta --no-agreement
 
 # Modality ablation (physio / audio / video / all)
 python3 main.py --ablation --no-optuna
-
-# Skip all negative controls
-python3 main.py --no-controls --no-optuna
 ```
 
 Each run saves to `results/run_YYYYMMDD_HHMM_<modalities>_<optuna>_<controls>/`.
@@ -303,7 +334,7 @@ AU and head-pose extraction requires py-feat + GPU. Run `notebooks/kaggle_video_
 | Video available for only 21/32 participants | Missing participants treated as NaN features |
 | N=16 dyads — very small sample; results may not replicate | All reported CIs and permutation tests reflect this uncertainty |
 | No speaker/listener state features (VAD) | Partner audio may predict emotion simply because partner is speaking |
-| No synchrony features (cross-correlation, mimicry) | Dyadic coupling may be better captured by joint features than raw partner state |
+| Synchrony features implemented but show no benefit over raw partner features | `sync_lag_0` indistinguishable from `sync_rnd` and `sync_circ` controls (all FDR p > 0.98) |
 | Categorical emotions (18 labels in self-reports) not yet modeled | Dimensional valence may be too coarse; category models not implemented |
 | Random-dyad baseline uses a single random draw | Multiple draws (N=100) would give a proper null CCC distribution |
 
@@ -320,6 +351,7 @@ AU and head-pose extraction requires py-feat + GPU. Run `notebooks/kaggle_video_
 | `RANDOM_SEED` | 42 | Global seed for reproducibility |
 | `OPTUNA_TRIALS` | 10 | Optuna trials per LOSO fold |
 | `OPTUNA_INNER_SPLITS` | 3 | Inner GroupKFold splits for Optuna |
+| `SYNCHRONY_WINDOWS` | (3, 6, 12) | Rolling correlation window sizes in segments (15s, 30s, 60s) |
 
 ---
 
