@@ -5,16 +5,10 @@ from sklearn.svm import LinearSVR as _SVR
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
-try:
-    from xgboost import XGBRegressor as _XGB
-    _HAS_XGB = True
-except ImportError:
-    from sklearn.ensemble import GradientBoostingRegressor as _XGB
-    _HAS_XGB = False
-
 from config import (RIDGE_ALPHA, SVR_C, SVR_GAMMA,
-                    XGB_N, XGB_DEPTH, XGB_LR,
-                    LSTM_HIDDEN, LSTM_EPOCHS, LSTM_LR, LSTM_BATCH,
+                    CB_ITERS, CB_DEPTH, CB_LR,
+                    LSTM_HIDDEN, LSTM_LAYERS, LSTM_DROPOUT,
+                    LSTM_SEQ_LEN, LSTM_EPOCHS, LSTM_LR, LSTM_BATCH,
                     OPTUNA_TRIALS, OPTUNA_INNER_SPLITS)
 
 
@@ -88,42 +82,6 @@ class SVRModel:
         return self._pipe.predict(X)
 
 
-class GradientBoostingModel:
-    name = "XGBoost" if _HAS_XGB else "GradientBoosting"
-    feature_importances_: Optional[np.ndarray] = None
-
-    def __init__(self):
-        if _HAS_XGB:
-            self._model = _XGB(
-                n_estimators=XGB_N,
-                max_depth=XGB_DEPTH,
-                learning_rate=XGB_LR,
-                subsample=0.8,
-                colsample_bytree=0.8,
-                random_state=42,
-                verbosity=0,
-            )
-        else:
-            self._model = _XGB(
-                n_estimators=XGB_N,
-                max_depth=XGB_DEPTH,
-                learning_rate=XGB_LR,
-                random_state=42,
-            )
-        self._medians = None
-
-    def fit(self, X_train, y_train):
-        X, self._medians = _impute_median(X_train)
-        self._model.fit(X, y_train)
-        if hasattr(self._model, "feature_importances_"):
-            self.feature_importances_ = self._model.feature_importances_
-        return self
-
-    def predict(self, X_test):
-        X = _apply_impute(X_test, self._medians)
-        return self._model.predict(X)
-
-
 try:
     import torch
     import torch.nn as nn
@@ -133,21 +91,22 @@ except ImportError:
     _HAS_TORCH = False
 
 
-class _LSTMNet(object if not _HAS_TORCH else object):
-    pass
-
-
 if _HAS_TORCH:
     class _LSTMNet(nn.Module):
-        def __init__(self, input_size, hidden_size):
+        def __init__(self, input_size, hidden_size, num_layers=2, dropout=0.2):
             super().__init__()
             self.lstm = nn.LSTM(input_size, hidden_size,
-                                num_layers=1, batch_first=True)
-            self.fc = nn.Linear(hidden_size, 1)
+                                num_layers=num_layers, batch_first=True,
+                                dropout=dropout if num_layers > 1 else 0.0)
+            self.drop = nn.Dropout(dropout)
+            self.fc   = nn.Linear(hidden_size, 1)
 
         def forward(self, x):
             out, _ = self.lstm(x)
-            return self.fc(out[:, -1, :]).squeeze(-1)
+            return self.fc(self.drop(out[:, -1, :])).squeeze(-1)
+else:
+    class _LSTMNet:
+        pass
 
 
 class LSTMModel:
@@ -159,36 +118,56 @@ class LSTMModel:
         self._medians = None
         self._scaler_mean = None
         self._scaler_std = None
+        self._device = None
+        self._fallback = None
 
-    def _scale(self, X):
+    def _build_sequences(self, X: np.ndarray, groups=None) -> np.ndarray:
+        W = LSTM_SEQ_LEN
+        n, d = X.shape
+        seqs = np.zeros((n, W, d), dtype=np.float32)
+        if groups is None:
+            groups = np.zeros(n, dtype=int)
+        for sess in np.unique(groups):
+            idx = np.where(groups == sess)[0]
+            idx = idx[np.argsort(idx)]
+            X_sess = X[idx]
+            for local_t, global_t in enumerate(idx):
+                start = max(0, local_t - W + 1)
+                window = X_sess[start : local_t + 1]
+                seqs[global_t, W - len(window) :] = window
+        return seqs
+
+    def _scale(self, X: np.ndarray) -> np.ndarray:
         return (X - self._scaler_mean) / (self._scaler_std + 1e-8)
 
-    def fit(self, X_train, y_train):
+    def fit(self, X_train, y_train, groups=None):
         if not _HAS_TORCH:
-            self._fallback = RidgeRegression().fit(X_train, y_train)
+            self._fallback = RidgeCVModel().fit(X_train, y_train)
             return self
 
         X, self._medians = _impute_median(X_train)
         self._scaler_mean = X.mean(axis=0)
-        self._scaler_std = X.std(axis=0)
-        X_s = self._scale(X)
+        self._scaler_std  = X.std(axis=0)
+        X_s = self._scale(X).astype(np.float32)
+        X_seq = self._build_sequences(X_s, groups)
 
+        self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         n_feat = X_s.shape[1]
-        self._net = _LSTMNet(n_feat, LSTM_HIDDEN)
-        opt = torch.optim.Adam(self._net.parameters(), lr=LSTM_LR)
+        self._net = _LSTMNet(n_feat, LSTM_HIDDEN, LSTM_LAYERS, LSTM_DROPOUT).to(self._device)
+        opt     = torch.optim.Adam(self._net.parameters(), lr=LSTM_LR)
         loss_fn = nn.MSELoss()
 
-        Xt = torch.tensor(X_s, dtype=torch.float32).unsqueeze(1)
-        yt = torch.tensor(y_train, dtype=torch.float32)
+        Xt = torch.from_numpy(X_seq)
+        yt = torch.from_numpy(y_train.astype(np.float32))
         ds = TensorDataset(Xt, yt)
         dl = DataLoader(ds, batch_size=LSTM_BATCH, shuffle=True)
 
         self._net.train()
         for _ in range(LSTM_EPOCHS):
             for xb, yb in dl:
+                xb, yb = xb.to(self._device), yb.to(self._device)
                 opt.zero_grad()
-                pred = self._net(xb)
-                loss_fn(pred, yb).backward()
+                loss_fn(self._net(xb), yb).backward()
                 opt.step()
         return self
 
@@ -196,11 +175,12 @@ class LSTMModel:
         if not _HAS_TORCH or self._net is None:
             return self._fallback.predict(X_test)
         X = _apply_impute(X_test, self._medians)
-        X_s = self._scale(X)
-        Xt = torch.tensor(X_s, dtype=torch.float32).unsqueeze(1)
+        X_s = self._scale(X).astype(np.float32)
+        X_seq = self._build_sequences(X_s)
+        Xt = torch.from_numpy(X_seq).to(self._device)
         self._net.eval()
         with torch.no_grad():
-            return self._net(Xt).numpy()
+            return self._net(Xt).cpu().numpy()
 
 
 try:
@@ -209,9 +189,6 @@ try:
 except ImportError:
     _HAS_CB = False
 
-from config import XGB_N, XGB_DEPTH, XGB_LR
-
-
 class CatBoostModel:
     name = "CatBoost"
     feature_importances_: Optional[np.ndarray] = None
@@ -219,9 +196,9 @@ class CatBoostModel:
     def __init__(self):
         if _HAS_CB:
             self._model = _CB(
-                iterations=XGB_N,
-                depth=XGB_DEPTH,
-                learning_rate=XGB_LR,
+                iterations=CB_ITERS,
+                depth=CB_DEPTH,
+                learning_rate=CB_LR,
                 loss_function="RMSE",
                 random_seed=42,
                 verbose=0,
@@ -374,9 +351,9 @@ def all_models():
         MeanBaseline(),
         RidgeCVModel(),
         SVRModel(),
-        GradientBoostingModel(),
+
         CatBoostModel(),
         CatBoostOptuna(),
         EnsembleModel(),
-        # LSTMModel(),
+        LSTMModel(),
     ]

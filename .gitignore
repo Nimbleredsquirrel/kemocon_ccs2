@@ -1,0 +1,6 @@
+# Игнорировать системные файлы macOS
+.DS_Store
+**/.DS_Store
+
+# Игнорировать кэш Claude AI
+.claude/

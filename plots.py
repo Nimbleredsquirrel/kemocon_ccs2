@@ -10,7 +10,7 @@ import json
 FIG_DIR = Path(__file__).parent / "results" / "figures"
 
 PALETTE = {"sync": "#4C72B0", "retro": "#DD8452"}
-MODEL_ORDER = ["MeanBaseline", "Ridge", "SVR", "XGBoost", "CatBoost", "LSTM"]
+MODEL_ORDER = ["MeanBaseline", "Ridge", "SVR", "CatBoost", "LSTM"]
 
 def plot_ccc_comparison(summary: pd.DataFrame, tag: str = "") -> None:
     """
@@ -226,7 +226,7 @@ def plot_dyad_heatmap(results_df: "pd.DataFrame", target: str,
     if sub.empty:
         return
     models_ordered = [m for m in
-                      ["MeanBaseline", "RidgeCV", "SVR", "XGBoost", "CatBoost", "Ensemble"]
+                      ["MeanBaseline", "RidgeCV", "SVR", "CatBoost", "Ensemble"]
                       if m in sub["model"].unique()]
     extra = [m for m in sub["model"].unique() if m not in models_ordered]
     models_ordered += extra
@@ -518,6 +518,115 @@ def plot_synchrony_comparison(summary_sync: pd.DataFrame,
     print(f"  Saved: {path.name}")
 
 
+def plot_h1_summary(h1a_df: "pd.DataFrame", h1b_df: "pd.DataFrame" = None) -> None:
+    """
+    Horizontal bar chart of median Δ CCC for H1a and H1b comparisons.
+    Positive = real partner lag_0 outperforms the baseline.
+    Color: green if FDR p < 0.05, gray otherwise.
+    """
+    FIG_DIR.mkdir(parents=True, exist_ok=True)
+    label_map = {
+        "lag_0 vs MeanBaseline":      "vs Mean baseline",
+        "lag_0 vs random_dyad":       "vs Random dyad",
+        "lag_0 vs circ_shift":        "vs Circ. shift",
+        "lag_0 vs missingness":       "vs Missingness",
+        "lag_0 vs own_signal":        "vs Own signal",
+        "lag_0 vs label_ar_own":      "vs Label AR (own)",
+        "lag_0 vs label_ar_combined": "vs Label AR (combined)",
+    }
+
+    targets = list(h1a_df["target"].unique()) if h1a_df is not None and len(h1a_df) else []
+    if not targets:
+        return
+
+    fig, axes = plt.subplots(1, len(targets),
+                              figsize=(max(10, 6 * len(targets)), 5),
+                              squeeze=False)
+
+    for col_i, target in enumerate(targets):
+        ax = axes[0][col_i]
+        rows = []
+
+        if h1a_df is not None:
+            sub = h1a_df[h1a_df["target"] == target]
+            for _, r in sub.iterrows():
+                rows.append({
+                    "label":  label_map.get(r["comparison"], r["comparison"]),
+                    "delta":  float(r["median_delta"]) if "median_delta" in r.index else np.nan,
+                    "p_fdr":  float(r.get("wilcoxon_p_fdr", 1.0)),
+                    "family": "H1a",
+                })
+
+        n_h1a = len(rows)
+        rows.append({"label": "", "delta": np.nan, "p_fdr": 1.0, "family": "sep"})
+
+        if h1b_df is not None:
+            sub = h1b_df[h1b_df["target"] == target]
+            for _, r in sub.iterrows():
+                rows.append({
+                    "label":  label_map.get(r["comparison"], r["comparison"]),
+                    "delta":  float(r["median_delta"]) if "median_delta" in r.index else np.nan,
+                    "p_fdr":  float(r.get("wilcoxon_p_fdr", 1.0)),
+                    "family": "H1b",
+                })
+
+        if not rows:
+            continue
+
+        labels = [r["label"] for r in rows]
+        deltas = [r["delta"] if np.isfinite(r.get("delta", np.nan)) else 0.0 for r in rows]
+        colors = []
+        for r in rows:
+            if r["family"] == "sep":
+                colors.append("none")
+            elif r["p_fdr"] < 0.05:
+                colors.append("#27ae60")
+            else:
+                colors.append("#bdc3c7")
+
+        y = np.arange(len(rows))
+        ax.barh(y, deltas, color=colors, alpha=0.88, edgecolor="black", linewidth=0.4)
+        ax.axvline(0, color="black", linewidth=1.0)
+
+        for i, r in enumerate(rows):
+            if r["family"] == "sep" or np.isnan(r.get("delta", np.nan)):
+                continue
+            p = r["p_fdr"]
+            d = r["delta"]
+            marker = "**" if p < 0.01 else ("*" if p < 0.05 else "ns")
+            offset = 0.004 if d >= 0 else -0.004
+            ha = "left" if d >= 0 else "right"
+            ax.text(d + offset, i, marker, va="center", ha=ha, fontsize=8, fontweight="bold")
+
+        # Family labels
+        if n_h1a > 0:
+            ax.text(ax.get_xlim()[0], -0.6, "H1a (primary)",
+                    fontsize=7, color="#555555", style="italic")
+        if h1b_df is not None and len(h1b_df[h1b_df["target"] == target]):
+            ax.text(ax.get_xlim()[0], n_h1a + 0.6, "H1b (stricter)",
+                    fontsize=7, color="#555555", style="italic")
+
+        ax.set_yticks(y)
+        ax.set_yticklabels(labels, fontsize=9)
+        ax.set_xlabel("Median Δ CCC  (lag_0 − baseline)")
+        ax.set_title(f"{target}", fontsize=11)
+        ax.invert_yaxis()
+
+    patches = [
+        mpatches.Patch(color="#27ae60", label="FDR p < 0.05"),
+        mpatches.Patch(color="#bdc3c7", label="ns"),
+    ]
+    axes[0][-1].legend(handles=patches, loc="lower right", fontsize=8)
+
+    fig.suptitle("H1: Real Partner Features vs Control Baselines\n"
+                 "(positive = real partner outperforms baseline)", fontsize=11)
+    plt.tight_layout()
+    path = FIG_DIR / "h1_summary.png"
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"  Saved: {path.name}")
+
+
 def _pretty(col: str) -> str:
     return (col
         .replace("aud_F0semitoneFrom27.5Hz_sma3nz_amean", "F0 mean")
@@ -563,8 +672,11 @@ def generate_all(results_df: pd.DataFrame, summary: pd.DataFrame,
                  summary_sync: pd.DataFrame = None,
                  stat_model_df: pd.DataFrame = None,
                  stat_lag_df: pd.DataFrame = None,
-                 stat_ctrl_df: pd.DataFrame = None) -> None:
+                 stat_h1a_df: pd.DataFrame = None,
+                 stat_h1b_df: pd.DataFrame = None) -> None:
     """Generate all standard plots from a completed run."""
+    global FIG_DIR
+    FIG_DIR = results_dir / "figures"
     FIG_DIR.mkdir(parents=True, exist_ok=True)
     print("\nGenerating plots …")
 
@@ -599,7 +711,11 @@ def generate_all(results_df: pd.DataFrame, summary: pd.DataFrame,
         plot_stat_table(stat_model_df, "Model Comparisons (Wilcoxon FDR)", "model")
     if stat_lag_df is not None:
         plot_stat_table(stat_lag_df,   "Lag Comparisons vs lag_0 (Wilcoxon FDR)", "lag")
-    if stat_ctrl_df is not None:
-        plot_stat_table(stat_ctrl_df,  "Control Comparisons (Wilcoxon FDR)", "ctrl")
+    if stat_h1a_df is not None or stat_h1b_df is not None:
+        plot_h1_summary(stat_h1a_df, stat_h1b_df)
+    if stat_h1a_df is not None:
+        plot_stat_table(stat_h1a_df, "H1a: Partner vs Controls (Wilcoxon FDR)", "h1a")
+    if stat_h1b_df is not None:
+        plot_stat_table(stat_h1b_df, "H1b: Partner vs Own-History (Wilcoxon FDR)", "h1b")
 
     print(f"All figures saved to {FIG_DIR}/")

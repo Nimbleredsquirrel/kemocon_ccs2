@@ -121,7 +121,7 @@ def build_self_seg_tables(seg_tables_ext: dict) -> dict:
     return _swap_labels(seg_tables_ext, load_self_annotations)
 
 def save_feature_importances(pairs, tag: str = ""):
-    from models import GradientBoostingModel, CatBoostModel
+    from models import CatBoostModel
     import json
 
     feat_names = None
@@ -132,7 +132,7 @@ def save_feature_importances(pairs, tag: str = ""):
     if feat_names is None:
         return
 
-    for ModelClass in [GradientBoostingModel, CatBoostModel]:
+    for ModelClass in [CatBoostModel]:
         m_instance = ModelClass()
         for target in TARGETS:
             sel = [p for p in pairs if p["target"]==target and p["condition"]=="sync"]
@@ -165,6 +165,8 @@ def parse_args():
                         help="Use physiological features only")
     parser.add_argument("--no-optuna",     action="store_true",
                         help="Skip CatBoostOptuna (much faster)")
+    parser.add_argument("--no-lstm",       action="store_true",
+                        help="Skip LSTMModel")
     parser.add_argument("--ablation",      action="store_true",
                         help="Run modality ablation (physio/audio/video/all)")
     parser.add_argument("--no-controls",   action="store_true",
@@ -277,6 +279,13 @@ def main():
         _models.all_models = lambda: [m for m in _orig()
                                        if m.name != "CatBoostOptuna"]
         print("  [--no-optuna] CatBoostOptuna disabled")
+
+    if args.no_lstm:
+        import models as _models_lstm
+        _orig_lstm = _models_lstm.all_models
+        _models_lstm.all_models = lambda: [m for m in _orig_lstm()
+                                            if m.name != "LSTM"]
+        print("  [--no-lstm] LSTMModel disabled")
 
     # ── 1. Load features ──────────────────────────────────────────────────
     print("\n[1/5] Loading physio + baseline normalisation …")
@@ -466,7 +475,7 @@ def main():
     if agreement_dfs:
         ag_for_plots = agreement_dfs.get(TARGETS[0], None)
 
-    stat_model_df, stat_lag_df, stat_ctrl_df = _build_stat_tables(results_ext, OUT_DIR)
+    stat_model_df, stat_lag_df, stat_h1a_df, stat_h1b_df = _build_stat_tables(results_ext, OUT_DIR)
 
     plots.generate_all(results_ext, summary_ext, OUT_DIR, summary_par,
                        agreement_dfs=ag_for_plots,
@@ -474,7 +483,8 @@ def main():
                        summary_sync=summary_sync,
                        stat_model_df=stat_model_df,
                        stat_lag_df=stat_lag_df,
-                       stat_ctrl_df=stat_ctrl_df)
+                       stat_h1a_df=stat_h1a_df,
+                       stat_h1b_df=stat_h1b_df)
     if summary_par is not None:
         plots.plot_ccc_comparison(summary_par, tag="partner")
     if summary_self is not None:
@@ -526,27 +536,51 @@ def _run_permutation_tests(results_df, summary_df):
 
     all_rows = []
 
-    # ── Family A: control comparisons ────────────────────────────────────
-    ctrl_baselines = ["label_ar_own", "label_ar_partner", "label_ar_combined",
-                      "random_dyad", "circ_shift", "own_signal", "missingness"]
-    ctrl_baselines = [b for b in ctrl_baselines if b in results_df["condition"].values]
-    ctrl_rows = []
+    # ── H1a: primary cross-person signal test ────────────────────────────
+    h1a_rows = []
+    if "MeanBaseline" in results_df["model"].values and ref_model != "MeanBaseline":
+        for target in TARGETS:
+            row = compare_models(results_df, target, "lag_0", ref_model, "MeanBaseline")
+            row["comparison"] = "lag_0 vs MeanBaseline"
+            row["cond_a"] = "lag_0"
+            row["cond_b"] = "MeanBaseline"
+            row["family"] = "h1a"
+            h1a_rows.append(row)
     for target in TARGETS:
-        for baseline in ctrl_baselines:
+        for baseline in ["random_dyad", "circ_shift", "missingness"]:
+            if baseline not in results_df["condition"].values:
+                continue
             row = compare_conditions(results_df, ref_model, target, "lag_0", baseline)
-            row["family"] = "control"
+            row["family"] = "h1a"
             row["comparison"] = f"lag_0 vs {baseline}"
-            ctrl_rows.append(row)
-    if ctrl_rows:
-        ctrl_df = pd.DataFrame(ctrl_rows)
-        ps = fdr_correction(ctrl_df["wilcoxon_p"].fillna(1.0).tolist())
-        ctrl_df["wilcoxon_p_fdr"] = ps
-        ps_sf = fdr_correction(ctrl_df["signflip_p"].fillna(1.0).tolist())
-        ctrl_df["signflip_p_fdr"] = ps_sf
-        print("\n  A) Control comparisons (ref model: lag_0 vs baseline):")
-        print(ctrl_df[["target", "cond_b", "median_delta",
-                        "wilcoxon_p", "wilcoxon_p_fdr"]].to_string(index=False))
-        all_rows.append(ctrl_df)
+            h1a_rows.append(row)
+    if h1a_rows:
+        h1a_df = pd.DataFrame(h1a_rows)
+        ps = fdr_correction(h1a_df["wilcoxon_p"].fillna(1.0).tolist())
+        h1a_df["wilcoxon_p_fdr"] = ps
+        print("\n  H1a) Partner signal vs primary controls (one-sided, FDR-corrected):")
+        print(h1a_df[["target", "comparison", "median_delta",
+                       "wilcoxon_p", "wilcoxon_p_fdr"]].to_string(index=False))
+        all_rows.append(h1a_df)
+
+    # ── H1b: stricter added-value tests ──────────────────────────────────
+    h1b_rows = []
+    for target in TARGETS:
+        for baseline in ["own_signal", "label_ar_own", "label_ar_combined"]:
+            if baseline not in results_df["condition"].values:
+                continue
+            row = compare_conditions(results_df, ref_model, target, "lag_0", baseline)
+            row["family"] = "h1b"
+            row["comparison"] = f"lag_0 vs {baseline}"
+            h1b_rows.append(row)
+    if h1b_rows:
+        h1b_df = pd.DataFrame(h1b_rows)
+        ps = fdr_correction(h1b_df["wilcoxon_p"].fillna(1.0).tolist())
+        h1b_df["wilcoxon_p_fdr"] = ps
+        print("\n  H1b) Partner vs own-history baselines [stricter, secondary]:")
+        print(h1b_df[["target", "comparison", "median_delta",
+                       "wilcoxon_p", "wilcoxon_p_fdr"]].to_string(index=False))
+        all_rows.append(h1b_df)
 
     # ── Family B: lag comparisons ─────────────────────────────────────────
     lag_conds = [c for c in ["lag_400ms_av", "lag_1", "lag_2", "lag_3", "lag_4"]
@@ -593,7 +627,7 @@ def _run_permutation_tests(results_df, summary_df):
     if all_rows:
         combined = pd.concat(all_rows, ignore_index=True)
         combined.to_csv(OUT_DIR / "permutation_tests.csv", index=False)
-        print("\n  (One-sided H1: condition_A > condition_B; FDR via Benjamini-Hochberg)")
+        print("\n  (One-sided tests: lag_0 > baseline; H1a = primary, H1b = stricter reference; FDR via Benjamini-Hochberg)")
         print(f"  Saved: permutation_tests.csv")
 
 
@@ -634,25 +668,47 @@ def _build_stat_tables(results_df, out_dir) -> tuple:
         stat_lag["wilcoxon_p_fdr"] = ps
         stat_lag.to_csv(out_dir / "stat_lag_comparisons.csv", index=False)
 
-    # Control comparison table
-    ctrl_baselines = ["label_ar_own", "label_ar_combined", "random_dyad", "circ_shift",
-                      "own_signal", "missingness"]
-    ctrl_baselines = [b for b in ctrl_baselines if b in results_df["condition"].values]
-    ctrl_rows = []
+    # H1a comparison table
+    h1a_rows = []
+    if "MeanBaseline" in results_df["model"].values and ref_model != "MeanBaseline":
+        for target in TARGETS:
+            row = compare_models(results_df, target, "lag_0", ref_model, "MeanBaseline")
+            row["comparison"] = "lag_0 vs MeanBaseline"
+            row["cond_a"] = "lag_0"
+            row["cond_b"] = "MeanBaseline"
+            row["family"] = "h1a"
+            h1a_rows.append(row)
+    h1a_baselines = [b for b in ["random_dyad", "circ_shift", "missingness"]
+                     if b in results_df["condition"].values]
     for target in TARGETS:
-        for baseline in ctrl_baselines:
+        for baseline in h1a_baselines:
             row = compare_conditions(results_df, ref_model, target, "lag_0", baseline)
             row["comparison"] = f"lag_0 vs {baseline}"
-            row["family"] = "control"
-            ctrl_rows.append(row)
-    stat_ctrl = None
-    if ctrl_rows:
-        stat_ctrl = pd.DataFrame(ctrl_rows)
-        ps = fdr_correction(stat_ctrl["wilcoxon_p"].fillna(1.0).tolist())
-        stat_ctrl["wilcoxon_p_fdr"] = ps
-        stat_ctrl.to_csv(out_dir / "stat_control_comparisons.csv", index=False)
+            row["family"] = "h1a"
+            h1a_rows.append(row)
+    stat_h1a = None
+    if h1a_rows:
+        stat_h1a = pd.DataFrame(h1a_rows)
+        stat_h1a["wilcoxon_p_fdr"] = fdr_correction(stat_h1a["wilcoxon_p"].fillna(1.0).tolist())
+        stat_h1a.to_csv(out_dir / "stat_h1a_comparisons.csv", index=False)
 
-    return stat_model, stat_lag, stat_ctrl
+    # H1b comparison table
+    h1b_baselines = [b for b in ["own_signal", "label_ar_own", "label_ar_combined"]
+                     if b in results_df["condition"].values]
+    h1b_rows = []
+    for target in TARGETS:
+        for baseline in h1b_baselines:
+            row = compare_conditions(results_df, ref_model, target, "lag_0", baseline)
+            row["comparison"] = f"lag_0 vs {baseline}"
+            row["family"] = "h1b"
+            h1b_rows.append(row)
+    stat_h1b = None
+    if h1b_rows:
+        stat_h1b = pd.DataFrame(h1b_rows)
+        stat_h1b["wilcoxon_p_fdr"] = fdr_correction(stat_h1b["wilcoxon_p"].fillna(1.0).tolist())
+        stat_h1b.to_csv(out_dir / "stat_h1b_comparisons.csv", index=False)
+
+    return stat_model, stat_lag, stat_h1a, stat_h1b
 
 def _print_incremental_delta(summary):
     """Print ΔCCC table for M1→M4."""
@@ -803,33 +859,59 @@ def _print_pair_summary(pairs):
             print(f"  {t:8s} {c:15s}: {n:3d} pairs, {s:5d} segments")
 
 def _print_hypothesis_tests(summary):
-    print("\n--- H₁: best CCC above chance? ---")
+    print("\n--- H₁a (primary): partner lag_0 vs control baselines ---")
     for t in TARGETS:
-        sub = summary[summary["target"]==t].sort_values("ccc_mean", ascending=False)
-        best = sub.iloc[0]
-        sign = ("✓ supported"  if best["ccc_mean"] > 0.05 else
-                "~ marginal"   if best["ccc_mean"] > 0   else
-                "✗ not supported")
-        print(f"  {t:8s}  best={best['model']:20s}  cond={best['condition']}  "
-              f"CCC={best['ccc_mean']:.4f}  {sign}")
+        sub = summary[summary["target"] == t]
+        lag0 = sub[sub["condition"] == "lag_0"].sort_values("ccc_mean", ascending=False)
+        if lag0.empty:
+            continue
+        best = lag0.iloc[0]
+        lag0_ccc = float(best["ccc_mean"])
+        mb_row  = sub[(sub["condition"] == "lag_0") & (sub["model"] == "MeanBaseline")]["ccc_mean"]
+        rd_row  = sub[sub["condition"] == "random_dyad"].sort_values("ccc_mean", ascending=False)
+        cs_row  = sub[sub["condition"] == "circ_shift"].sort_values("ccc_mean", ascending=False)
+        mb_ccc  = float(mb_row.values[0]) if len(mb_row) else np.nan
+        rd_ccc  = float(rd_row.iloc[0]["ccc_mean"]) if len(rd_row) else np.nan
+        cs_ccc  = float(cs_row.iloc[0]["ccc_mean"]) if len(cs_row) else np.nan
+        excl_mb = "" if np.isnan(mb_ccc) else f"  Δ_vs_mean={lag0_ccc - mb_ccc:+.4f}"
+        excl_rd = "" if np.isnan(rd_ccc) else f"  Δ_vs_rnd={lag0_ccc - rd_ccc:+.4f}"
+        excl_cs = "" if np.isnan(cs_ccc) else f"  Δ_vs_circ={lag0_ccc - cs_ccc:+.4f}"
+        print(f"  {t:8s}  best={best['model']:20s}  CCC={lag0_ccc:.4f}"
+              f"{excl_mb}{excl_rd}{excl_cs}")
+
+    print("\n--- H₁b (stricter, secondary): partner lag_0 vs own-history baselines ---")
+    for t in TARGETS:
+        sub = summary[summary["target"] == t]
+        lag0 = sub[sub["condition"] == "lag_0"].sort_values("ccc_mean", ascending=False)
+        if lag0.empty:
+            continue
+        m = lag0.iloc[0]["model"]
+        lag0_ccc = float(lag0.iloc[0]["ccc_mean"])
+        ar_row  = sub[(sub["condition"] == "label_ar_own") & (sub["model"] == m)]["ccc_mean"]
+        ow_row  = sub[(sub["condition"] == "own_signal")   & (sub["model"] == m)]["ccc_mean"]
+        ar_ccc  = float(ar_row.values[0])  if len(ar_row)  else np.nan
+        ow_ccc  = float(ow_row.values[0])  if len(ow_row)  else np.nan
+        ar_str  = f"  label_ar_own={ar_ccc:.4f}  Δ={lag0_ccc - ar_ccc:+.4f}" if not np.isnan(ar_ccc) else ""
+        ow_str  = f"  own_signal={ow_ccc:.4f}  Δ={lag0_ccc - ow_ccc:+.4f}" if not np.isnan(ow_ccc) else ""
+        print(f"  {t:8s}  lag_0({m})={lag0_ccc:.4f}{ar_str}{ow_str}")
 
     print("\n--- H₂: best lag vs synchronous (lag_0)? ---")
     for t in TARGETS:
         print(f"\n  {t}:")
         for m in summary["model"].unique():
-            sub = summary[(summary["model"]==m) & (summary["target"]==t)]
-            lag0 = sub[sub["condition"]=="lag_0"]["ccc_mean"].values
+            sub = summary[(summary["model"] == m) & (summary["target"] == t)]
+            lag0 = sub[sub["condition"] == "lag_0"]["ccc_mean"].values
             if not len(lag0):
                 continue
             best_lag = sub.sort_values("ccc_mean", ascending=False).iloc[0]
             d = float(best_lag["ccc_mean"] - lag0[0])
             print(f"    {m:20s}  sync={lag0[0]:.4f}  "
                   f"best={best_lag['ccc_mean']:.4f} @ {best_lag['condition']}  Δ={d:+.4f}  "
-                  f"{'✓' if d>0 else '✗'}")
+                  f"{'✓' if d > 0 else '✗'}")
 
     print("\n--- Best lag per target (averaged across models) ---")
     for t in TARGETS:
-        sub = summary[summary["target"]==t]
+        sub = summary[summary["target"] == t]
         lag_means = sub.groupby("condition")["ccc_mean"].mean().sort_values(ascending=False)
         print(f"  {t}:")
         for cond, val in lag_means.items():

@@ -1,0 +1,13 @@
+model,target,cond_a,cond_b,median_delta,wilcoxon_p,signflip_p,n_sessions,comparison,family,wilcoxon_p_fdr
+CatBoostOptuna,arousal,lag_0,label_ar_own,-0.41116689869927076,1.0,1.0,16,lag_0 vs label_ar_own,control,1.0
+CatBoostOptuna,arousal,lag_0,label_ar_combined,-0.43250452299897224,1.0,1.0,16,lag_0 vs label_ar_combined,control,1.0
+CatBoostOptuna,arousal,lag_0,random_dyad,-0.005898358630907371,0.7017059326171875,0.41645835416458354,16,lag_0 vs random_dyad,control,1.0
+CatBoostOptuna,arousal,lag_0,circ_shift,0.024793214080621837,0.105712890625,0.07139286071392861,16,lag_0 vs circ_shift,control,0.63427734375
+CatBoostOptuna,arousal,lag_0,own_signal,-0.0584209602052419,0.990875244140625,0.9905009499050095,16,lag_0 vs own_signal,control,1.0
+CatBoostOptuna,arousal,lag_0,missingness,0.0017945911579959747,0.4899749755859375,0.41775822417758224,16,lag_0 vs missingness,control,1.0
+CatBoostOptuna,valence,lag_0,label_ar_own,-0.24574416699300727,0.9968407392231587,0.9987001299870013,16,lag_0 vs label_ar_own,control,1.0
+CatBoostOptuna,valence,lag_0,label_ar_combined,-0.2843249812643662,0.9968407392231587,0.9987001299870013,16,lag_0 vs label_ar_combined,control,1.0
+CatBoostOptuna,valence,lag_0,random_dyad,0.007166954188106504,0.07890568448422747,0.05469453054694531,16,lag_0 vs random_dyad,control,0.63427734375
+CatBoostOptuna,valence,lag_0,circ_shift,0.0,0.6112176915716796,0.6405359464053595,16,lag_0 vs circ_shift,control,1.0
+CatBoostOptuna,valence,lag_0,own_signal,0.004152826386765681,0.38878230842832034,0.5588441155884412,16,lag_0 vs own_signal,control,1.0
+CatBoostOptuna,valence,lag_0,missingness,-0.000593430622679567,0.6112176915716796,0.7197280271972802,16,lag_0 vs missingness,control,1.0

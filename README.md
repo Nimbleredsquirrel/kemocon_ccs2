@@ -10,11 +10,87 @@ Cross-person emotion prediction on the [K-EmoCon dataset](https://www.nature.com
 
 ## Research Hypotheses
 
-**H₁** — Cross-person prediction exceeds non-dyadic and time-shuffled baselines under LOSO evaluation, *and* exceeds own-label autoregression (emotional inertia alone).
+**H₁a — Partner-specific cross-person signal (primary test):** Under LOSO evaluation, real partner multimodal features will predict the target participant's affect better than mean prediction, random non-partner pairing, circularly shifted partner features, and missingness-only diagnostics.
 
-**H₂** — Specific theoretically motivated temporal offsets outperform synchronous prediction, with direction depending on modality: short lags (≤ 400ms) for audio/video, longer lags (5–20s) for physiology.
+Operationally (one-sided Wilcoxon + sign-flip, FDR-corrected within family):
+```
+lag_0 > MeanBaseline   — any feature signal at all?
+lag_0 > random_dyad    — real partner identity matters, not just general debate patterns?
+lag_0 > circ_shift     — real-time temporal alignment matters, not just session distribution?
+lag_0 > missingness    — not a missing-data artifact?
+```
 
-Both are tested separately for **arousal** and **valence**, across all three annotation perspectives.
+**H₁b — Added-value test (stricter, secondary):** Partner features improve prediction when compared with the target participant's own emotional history and own multimodal features. This is a harder bar — own-person information is expected to be more directly predictive — and is reported as a severity check, not a primary criterion.
+
+Operationally:
+```
+lag_0 vs label_ar_own   — partner beats emotional inertia?
+lag_0 vs own_signal     — partner beats self-sensing?
+M4 > M2                 — partner features add value when own features are already included?
+```
+
+> H₁ was not defined as "partner features outperform target's own features" because self-features and self-history are expected to be more directly informative. H₁a tests whether real partner features outperform appropriate null baselines. Own-signal and label-AR models serve as reference ceilings for H₁b.
+
+**H₂ — Temporal specificity:** Specific temporal offsets outperform synchronous prediction, with direction depending on modality: short offsets (≤ 400ms) for audio/video, longer lags (5–20s) for physiology.
+
+All hypotheses are tested separately for **arousal** and **valence**, across all three annotation perspectives.
+
+---
+
+## H1a Required Baselines
+
+### 1. MeanBaseline
+
+*Checks:* is the model better than simply predicting the mean emotion?
+
+```
+CatBoostOptuna lag_0 > MeanBaseline
+RidgeCV        lag_0 > MeanBaseline
+```
+
+If no model beats MeanBaseline, the signal is negligible.
+
+---
+
+### 2. Random-dyad control ← most important
+
+*Checks:* does the real partner B specifically matter, or does any random stranger work just as well?
+
+```
+real partner lag_0 > random_dyad
+```
+
+| Outcome | Interpretation |
+|---------|----------------|
+| real > random | partner-specific signal exists |
+| real ≈ random | model captures general debate/speaker patterns, not dyadic coupling |
+
+---
+
+### 3. Circular-shift control ← second most important
+
+*Checks:* does real-time synchronisation with the partner matter, or is the model exploiting the session/person distribution?
+
+```
+real partner lag_0 > circular_shift
+```
+
+| Outcome | Interpretation |
+|---------|----------------|
+| real > circular | evidence for real-time interpersonal timing |
+| real ≈ circular | model may be capturing session-level distribution, not actual interaction |
+
+---
+
+### 4. Missingness-only diagnostic
+
+*Checks:* is the model predicting emotion from the signal, or from patterns in which data are missing?
+
+```
+real partner lag_0 > missingness-only
+```
+
+This is a data-quality check, not a headline result — missingness should not appear next to main models in narrative summaries. Its value is in ruling out a data-integrity confound.
 
 ---
 
@@ -22,11 +98,12 @@ Both are tested separately for **arousal** and **valence**, across all three ann
 
 Cross-person signal is treated as real only if it:
 
-1. Exceeds MeanBaseline, random-dyad, and circular-shift controls;
+1. Exceeds MeanBaseline, random-dyad pairing, and circular-shift controls (**H1a criterion**);
 2. Survives LOSO evaluation (no session leakage);
-3. Improves over own-label autoregression (emotional inertia);
-4. Is consistent across dyads, not driven by 1–2 sessions;
-5. Shows stronger effects for theoretically plausible modalities and lags.
+3. Is consistent across dyads, not driven by 1–2 outlier sessions;
+4. Shows stronger effects for theoretically plausible modalities and lags (H2).
+
+Comparison against own-signal and label-AR baselines is reported separately as a **severity check** (H1b): if partner features are weaker than own-person information, cross-person prediction may still be of scientific interest but has limited practical added value.
 
 ---
 
@@ -165,9 +242,9 @@ For every feature `f`, `delta_f = f[t] − f[t−1]` is appended, doubling the v
 |-----------|-------|---------------|
 | `lag_0` | 0 — synchronous | all |
 | `lag_400ms_av` | −400 ms anticipatory | audio/video only; physio window unchanged |
-| `lag_1` … `lag_4` | −5s … −20s (5s steps) | physio-scale lags |
+| `lag_1` … `lag_4` | −5s … −20s (5s steps) | all modalities (physio + audio + video) |
 
-The 400ms shift is applied only to audio/video features (re-extracted with a 400ms window offset). Physiology operates at 5s resolution — a 400ms offset has no meaningful effect on HR/EDA/temperature and is not applied.
+Lags `lag_1`–`lag_4` shift all modalities (physiology, audio, and video) by the corresponding number of 5-second segments. The 400ms condition (`lag_400ms_av`) is a special case: the offset is applied only to audio and video features (re-extracted from a time-shifted window), while physiology stays on the same 5-second grid since a 400ms shift carries no meaningful information at that resolution.
 
 ### Pair types in `dataset.py`
 
@@ -196,7 +273,6 @@ The 400ms shift is applied only to audio/video features (re-extracted with a 400
 | `MeanBaseline` | Training mean — chance |
 | `RidgeCVModel` | Ridge, alpha by leave-one-out CV |
 | `SVRModel` | LinearSVR |
-| `GradientBoostingModel` | XGBoost (sklearn fallback) |
 | `CatBoostModel` | Fixed hyperparameters |
 | `CatBoostOptuna` | Optuna inner 3-fold × 10 trials; uses GroupKFold by session |
 | `EnsembleModel` | Average of CatBoost + RidgeCV + SVR |
@@ -215,13 +291,14 @@ Additional metrics reported per fold: Pearson r, RMSE, **pred_dispersion** (std_
 
 ### Statistical tests (`evaluate.py`)
 
-Three test families are run and FDR-corrected independently:
+Four test families are run and FDR-corrected independently within each family:
 
 | Family | Comparisons | Tests |
 |--------|-------------|-------|
-| A — Control | `lag_0` vs each control condition | Wilcoxon signed-rank (one-sided) + sign-flip permutation (10 000 flips) |
-| B — Lag | `lag_1`–`lag_4`, `lag_400ms_av` vs `lag_0` | Same |
-| C — Model | CatBoost vs Ensemble/RidgeCV/SVR on `lag_0` | Same + bootstrap CI on mean Δ |
+| H1a | `lag_0` vs MeanBaseline (model), random\_dyad, circ\_shift, missingness | Wilcoxon signed-rank (one-sided) + sign-flip permutation (10 000 flips) |
+| H1b | `lag_0` vs own\_signal, label\_ar\_own, label\_ar\_combined | Same (stricter severity check) |
+| Lag | `lag_1`–`lag_4`, `lag_400ms_av` vs `lag_0` | Same |
+| Model | CatBoost vs Ensemble/RidgeCV/SVR on `lag_0` | Same + bootstrap CI on mean Δ |
 
 **FDR correction:** Benjamini-Hochberg applied within each family separately. Raw and adjusted p-values saved in `stat_*.csv` files.
 

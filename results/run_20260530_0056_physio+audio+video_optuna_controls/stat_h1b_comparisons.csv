@@ -1,0 +1,7 @@
+model,target,cond_a,cond_b,median_delta,wilcoxon_p,signflip_p,n_sessions,comparison,family,wilcoxon_p_fdr
+CatBoostOptuna,arousal,lag_0,own_signal,-0.0584209602052419,0.990875244140625,0.9905009499050095,16,lag_0 vs own_signal,h1b,1.0
+CatBoostOptuna,arousal,lag_0,label_ar_own,-0.41116689869927076,1.0,1.0,16,lag_0 vs label_ar_own,h1b,1.0
+CatBoostOptuna,arousal,lag_0,label_ar_combined,-0.4325045229989722,1.0,1.0,16,lag_0 vs label_ar_combined,h1b,1.0
+CatBoostOptuna,valence,lag_0,own_signal,0.00415282638676565,0.38878230842832034,0.5588441155884412,16,lag_0 vs own_signal,h1b,1.0
+CatBoostOptuna,valence,lag_0,label_ar_own,-0.2457441669930073,0.9968407392231587,0.9987001299870013,16,lag_0 vs label_ar_own,h1b,1.0
+CatBoostOptuna,valence,lag_0,label_ar_combined,-0.2843249812643662,0.9968407392231587,0.9987001299870013,16,lag_0 vs label_ar_combined,h1b,1.0

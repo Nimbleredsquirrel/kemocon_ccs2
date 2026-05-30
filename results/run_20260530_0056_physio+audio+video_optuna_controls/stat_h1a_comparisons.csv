@@ -1,0 +1,9 @@
+comparison,model_a,model_b,target,condition,median_delta,wilcoxon_p,signflip_p,boot_ci_lo,boot_ci_hi,n_sessions,cond_a,cond_b,family,model,wilcoxon_p_fdr
+lag_0 vs MeanBaseline,CatBoostOptuna,MeanBaseline,arousal,lag_0,-0.0005957215637119998,0.4499664306640625,0.2715728427157284,-0.021144170809535824,0.049517801209524766,16,lag_0,MeanBaseline,h1a,,0.6985345046533481
+lag_0 vs MeanBaseline,CatBoostOptuna,MeanBaseline,valence,lag_0,0.00034695890592185,0.07007303073420625,0.130986901309869,-0.005228977720523344,0.03122422803185372,16,lag_0,MeanBaseline,h1a,,0.2819010416666667
+lag_0 vs random_dyad,,,arousal,,-0.00589835863090735,0.7017059326171875,0.41645835416458354,,,16,lag_0,random_dyad,h1a,CatBoostOptuna,0.7017059326171875
+lag_0 vs circ_shift,,,arousal,,0.02479321408062185,0.105712890625,0.07139286071392861,,,16,lag_0,circ_shift,h1a,CatBoostOptuna,0.2819010416666667
+lag_0 vs missingness,,,arousal,,0.0017945911579959504,0.4899749755859375,0.41775822417758224,,,16,lag_0,missingness,h1a,CatBoostOptuna,0.6985345046533481
+lag_0 vs random_dyad,,,valence,,0.0071669541881064,0.07890568448422747,0.05469453054694531,,,16,lag_0,random_dyad,h1a,CatBoostOptuna,0.2819010416666667
+lag_0 vs circ_shift,,,valence,,0.0,0.6112176915716796,0.6405359464053595,,,16,lag_0,circ_shift,h1a,CatBoostOptuna,0.6985345046533481
+lag_0 vs missingness,,,valence,,-0.0005934306226795501,0.6112176915716796,0.7197280271972802,,,16,lag_0,missingness,h1a,CatBoostOptuna,0.6985345046533481
