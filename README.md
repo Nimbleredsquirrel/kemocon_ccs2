@@ -31,9 +31,9 @@ M4 > M2                 — partner features add value when own features are alr
 
 > H₁ was not defined as "partner features outperform target's own features" because self-features and self-history are expected to be more directly informative. H₁a tests whether real partner features outperform appropriate null baselines. Own-signal and label-AR models serve as reference ceilings for H₁b.
 
-**H₂ — Temporal specificity:** Specific temporal offsets outperform synchronous prediction, with direction depending on modality: short offsets (≤ 400ms) for audio/video, longer lags (5–20s) for physiology.
+**H₂ — Temporal specificity:** Time-lagged partner features may outperform synchronous features. The main 5-second lag grid (`lag_1`–`lag_4`) is applied to all modalities; `lag_400ms_av` is an exploratory audio/video-only offset targeting short-latency expressive cues.
 
-All hypotheses are tested separately for **arousal** and **valence**, across all three annotation perspectives.
+Primary hypothesis tests use external observer labels. Partner-report and self-report labels are evaluated as secondary lag_0 perspective checks.
 
 ---
 
@@ -185,8 +185,11 @@ kemocon_baseline/
         ├── permutation_tests.csv
         ├── stat_model_comparisons.csv
         ├── stat_lag_comparisons.csv
-        ├── stat_control_comparisons.csv
+        ├── stat_h1a_comparisons.csv
+        ├── stat_h1b_comparisons.csv
         ├── stat_synchrony_comparisons.csv  (unless --no-synchrony)
+        ├── feature_importance_arousal_catboost.json
+        ├── feature_importance_valence_catboost.json
         └── figures/
 ```
 
@@ -228,7 +231,7 @@ AU04, AU06, AU12, AU17 intensity mean/std; head pitch/yaw mean/std.
 
 ### Delta features
 
-For every feature `f`, `delta_f = f[t] − f[t−1]` is appended, doubling the vector. This captures rate-of-change. Enabled with `--delta` (off by default, slow).
+For every feature `f`, `delta_f = f[t] − f[t−1]` is appended to all main feature vectors by default, doubling the dimensionality. The `--no-delta` flag disables only the separate **label-delta target analysis** (predicting Δarousal / Δvalence as the target), not the feature deltas themselves.
 
 ---
 
@@ -298,7 +301,7 @@ Four test families are run and FDR-corrected independently within each family:
 | H1a | `lag_0` vs MeanBaseline (model), random\_dyad, circ\_shift, missingness | Wilcoxon signed-rank (one-sided) + sign-flip permutation (10 000 flips) |
 | H1b | `lag_0` vs own\_signal, label\_ar\_own, label\_ar\_combined | Same (stricter severity check) |
 | Lag | `lag_1`–`lag_4`, `lag_400ms_av` vs `lag_0` | Same |
-| Model | CatBoost vs Ensemble/RidgeCV/SVR on `lag_0` | Same + bootstrap CI on mean Δ |
+| Model | CatBoostOptuna vs fixed CatBoost / RidgeCV / SVR / Ensemble on `lag_0` | Same + bootstrap CI on mean Δ |
 
 **FDR correction:** Benjamini-Hochberg applied within each family separately. Raw and adjusted p-values saved in `stat_*.csv` files.
 
@@ -411,7 +414,7 @@ AU and head-pose extraction requires py-feat + GPU. Run `notebooks/kaggle_video_
 | Video available for only 21/32 participants | Missing participants treated as NaN features |
 | N=16 dyads — very small sample; results may not replicate | All reported CIs and permutation tests reflect this uncertainty |
 | No speaker/listener state features (VAD) | Partner audio may predict emotion simply because partner is speaking |
-| Synchrony features implemented but show no benefit over raw partner features | `sync_lag_0` indistinguishable from `sync_rnd` and `sync_circ` controls (all FDR p > 0.98) |
+| Synchrony features show no benefit over raw partner features | `sync_lag_0` indistinguishable from `sync_rnd` and `sync_circ` (all FDR p > 0.98); `sync_aug_lag_0 vs lag_0` key test uses RidgeCV/CatBoost only (CatBoostOptuna excluded from synchrony run for speed) |
 | Categorical emotions (18 labels in self-reports) not yet modeled | Dimensional valence may be too coarse; category models not implemented |
 | Random-dyad baseline uses a single random draw | Multiple draws (N=100) would give a proper null CCC distribution |
 

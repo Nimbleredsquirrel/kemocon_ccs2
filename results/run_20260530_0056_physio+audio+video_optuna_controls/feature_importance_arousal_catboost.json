@@ -1,0 +1,22 @@
+{
+  "e4_temp_mean": 17.323931042145965,
+  "e4_eda_mean": 8.001291349957643,
+  "aud_loudness_sma3_amean": 7.281003760401821,
+  "vid_yaw_mean": 6.387628899579943,
+  "aud_F0semitoneFrom27.5Hz_sma3nz_amean": 5.686256788960528,
+  "polar_hr_mean": 4.5214556814024105,
+  "vid_yaw_std": 4.2900963223189335,
+  "vid_pitch_mean": 3.734012758229926,
+  "delta_polar_hr_mean": 3.494229206954156,
+  "e4_temp_std": 3.0318852462199692,
+  "e4_eda_npeaks": 3.0292376182345744,
+  "e4_eda_range": 2.973971770384282,
+  "delta_polar_hr_std": 2.574048895606818,
+  "e4_eda_std": 2.34272486869552,
+  "e4_hr_mean": 1.96514185022002,
+  "aud_shimmerLocaldB_sma3nz_amean": 1.9353458386764435,
+  "e4_acc_mean": 1.7164540656291563,
+  "e4_temp_slope": 1.477135369190579,
+  "vid_pitch_std": 1.285374413232172,
+  "bw_delta_mean": 1.1644885968290706
+}

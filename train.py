@@ -82,6 +82,7 @@ def summarise(df: pd.DataFrame) -> pd.DataFrame:
             "ccc_ci_lo":      ci_lo,
             "ccc_ci_hi":      ci_hi,
             "r_mean":         grp["pearson_r"].mean(),
+            "mse_mean":       grp["mse"].mean(),
             "rmse_mean":      grp["rmse"].mean(),
             "pred_disp_mean": float(disp_col.mean()) if disp_col is not None else np.nan,
             "n_sessions":     len(grp),

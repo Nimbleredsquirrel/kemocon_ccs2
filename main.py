@@ -24,8 +24,8 @@ from dataset import (make_pairs, make_own_signal_pairs, make_random_dyad_pairs,
                      make_synchrony_pairs, make_synchrony_augmented_pairs,
                      make_random_synchrony_pairs, make_circular_shift_synchrony_pairs)
 from train import run_loso, summarise
-from evaluate import (annotation_agreement, compare_conditions, compare_models,
-                      fdr_correction, bootstrap_ci)
+from evaluate import (annotation_agreement, compare_conditions, compare_conditions_cross,
+                      compare_models, fdr_correction, bootstrap_ci)
 from data_quality import print_quality_report, usable_dyads, nan_fraction_per_session
 import plots
 
@@ -126,7 +126,7 @@ def save_feature_importances(pairs, tag: str = ""):
 
     feat_names = None
     for p in pairs:
-        if p["target"] == "arousal" and p["condition"] == "sync":
+        if p["target"] == "arousal" and p["condition"] == "lag_0":
             feat_names = p["feature_names"]
             break
     if feat_names is None:
@@ -135,7 +135,7 @@ def save_feature_importances(pairs, tag: str = ""):
     for ModelClass in [CatBoostModel]:
         m_instance = ModelClass()
         for target in TARGETS:
-            sel = [p for p in pairs if p["target"]==target and p["condition"]=="sync"]
+            sel = [p for p in pairs if p["target"]==target and p["condition"]=="lag_0"]
             if not sel:
                 continue
             X = np.vstack([p["X"] for p in sel])
@@ -345,8 +345,9 @@ def main():
     # ── 3. Primary LOSO (cross-person + 400ms + negative controls) ─────────
     print("\n[5/5] Cross-person prediction — PRIMARY (external observer) …")
     pairs_ext = make_pairs(seg_tables, good_dyads)
-    pairs_ext += make_pairs(seg_tables_400ms, good_dyads,
-                             conditions=[(0, "lag_400ms_av")])
+    if use_audio or use_video:
+        pairs_ext += make_pairs(seg_tables_400ms, good_dyads,
+                                 conditions=[(0, "lag_400ms_av")])
 
     if not args.no_controls:
         print("  Adding negative-control pairs …")
@@ -463,7 +464,7 @@ def main():
     if not args.no_synchrony:
         print("\n--- Synchrony Feature Analysis ---")
         print("  Dyadic coupling features: |A-B|, z-score dist, product, cos-sim, rolling corr")
-        summary_sync = _run_synchrony_analysis(seg_tables, good_dyads, OUT_DIR)
+        summary_sync = _run_synchrony_analysis(seg_tables, good_dyads, OUT_DIR, results_ext)
 
     # ── 8b. Modality ablation ──────────────────────────────────────────────
     if args.ablation:
@@ -731,7 +732,8 @@ def _print_incremental_delta(summary):
                   f"Δ(M4−M2)={m4-m2:+.4f}  "
                   f"[M4={m4:.4f}]")
 
-def _run_synchrony_analysis(seg_tables, good_dyads, out_dir) -> pd.DataFrame:
+def _run_synchrony_analysis(seg_tables, good_dyads, out_dir,
+                             results_ext=None) -> pd.DataFrame:
     """
     Synchrony extension: test whether dyadic coupling features predict affect
     beyond raw partner features.
@@ -775,17 +777,32 @@ def _run_synchrony_analysis(seg_tables, good_dyads, out_dir) -> pd.DataFrame:
     print("\n=== Synchrony Results ===")
     print(summary_sync.to_string(index=False))
 
-    # Key test: sync_aug_lag_0 vs lag_0 (from primary results — not available here)
-    # Print what we have: sync vs sync controls
-    print("\n  Synchrony control tests (sync_lag_0 vs sync_rnd, sync_circ):")
-    ref_model = _pick_ref_model(results_sync)
+    ref_model_sync = _pick_ref_model(results_sync)
     sync_rows = []
+
+    # Key test: sync_aug_lag_0 vs lag_0 from primary results
+    if results_ext is not None and "sync_aug_lag_0" in results_sync["condition"].values:
+        print("\n  Synchrony key test (sync_aug_lag_0 vs lag_0 from primary):")
+        key_models = [m for m in ["CatBoost", "RidgeCV"]
+                      if m in results_sync["model"].values and m in results_ext["model"].values]
+        for target in TARGETS:
+            for m in key_models:
+                row = compare_conditions_cross(
+                    results_sync, results_ext, m, target, "sync_aug_lag_0", "lag_0")
+                row["comparison"] = f"sync_aug_lag_0 vs lag_0 ({m})"
+                row["family"] = "sync_key"
+                sync_rows.append(row)
+
+    # Control tests: sync_lag_0 vs sync_rnd, sync_circ
+    print("\n  Synchrony control tests (sync_lag_0 vs sync_rnd, sync_circ):")
     for target in TARGETS:
         for ctrl in ["sync_rnd", "sync_circ"]:
             if ctrl in results_sync["condition"].values:
-                row = compare_conditions(results_sync, ref_model, target, "sync_lag_0", ctrl)
+                row = compare_conditions(results_sync, ref_model_sync, target, "sync_lag_0", ctrl)
                 row["comparison"] = f"sync_lag_0 vs {ctrl}"
+                row["family"] = "sync_ctrl"
                 sync_rows.append(row)
+
     if sync_rows:
         sync_stat = pd.DataFrame(sync_rows)
         ps = fdr_correction(sync_stat["wilcoxon_p"].fillna(1.0).tolist())

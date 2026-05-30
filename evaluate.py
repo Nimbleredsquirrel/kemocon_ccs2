@@ -100,14 +100,21 @@ def sign_flip_test(a: np.ndarray, b: np.ndarray,
 
 def compare_conditions(results_df, model: str, target: str,
                        cond_a: str, cond_b: str) -> dict:
-    def _cccs(cond):
+    import pandas as pd
+
+    def _series(cond):
         sub = results_df[(results_df["model"] == model) &
                          (results_df["target"] == target) &
                          (results_df["condition"] == cond)]
-        return sub.sort_values("held_out_session")["ccc"].values
+        return sub[["held_out_session", "ccc"]].copy()
 
-    a_vals = _cccs(cond_a)
-    b_vals = _cccs(cond_b)
+    merged = (_series(cond_a).rename(columns={"ccc": "ccc_a"})
+              .merge(_series(cond_b).rename(columns={"ccc": "ccc_b"}),
+                     on="held_out_session")
+              .dropna(subset=["ccc_a", "ccc_b"]))
+
+    a_vals = merged["ccc_a"].values
+    b_vals = merged["ccc_b"].values
     wx = wilcoxon_test(a_vals, b_vals)
     sf = sign_flip_test(a_vals, b_vals)
     return {"model": model, "target": target,
@@ -154,14 +161,21 @@ def bootstrap_ci(a: np.ndarray, b: np.ndarray,
 def compare_models(results_df, target: str, cond: str,
                    model_a: str, model_b: str) -> dict:
     """Per-session CCC paired comparison between two models on the same condition."""
-    def _cccs(model):
+    import pandas as pd
+
+    def _series(model):
         sub = results_df[(results_df["model"] == model) &
                          (results_df["target"] == target) &
                          (results_df["condition"] == cond)]
-        return sub.sort_values("held_out_session")["ccc"].values
+        return sub[["held_out_session", "ccc"]].copy()
 
-    a_vals = _cccs(model_a)
-    b_vals = _cccs(model_b)
+    merged = (_series(model_a).rename(columns={"ccc": "ccc_a"})
+              .merge(_series(model_b).rename(columns={"ccc": "ccc_b"}),
+                     on="held_out_session")
+              .dropna(subset=["ccc_a", "ccc_b"]))
+
+    a_vals = merged["ccc_a"].values
+    b_vals = merged["ccc_b"].values
     wx = wilcoxon_test(a_vals, b_vals)
     sf = sign_flip_test(a_vals, b_vals)
     ci_lo, ci_hi = bootstrap_ci(a_vals, b_vals)
@@ -175,6 +189,35 @@ def compare_models(results_df, target: str, cond: str,
         "boot_ci_lo":   ci_lo,   "boot_ci_hi": ci_hi,
         "n_sessions":   wx["n"],
     }
+
+
+def compare_conditions_cross(results_a, results_b,
+                              model: str, target: str,
+                              cond_a: str, cond_b: str) -> dict:
+    """Paired per-session comparison between a condition in results_a and one in results_b."""
+    import pandas as pd
+
+    def _series(df, cond):
+        sub = df[(df["model"] == model) &
+                 (df["target"] == target) &
+                 (df["condition"] == cond)]
+        return sub[["held_out_session", "ccc"]].copy()
+
+    merged = (_series(results_a, cond_a).rename(columns={"ccc": "ccc_a"})
+              .merge(_series(results_b, cond_b).rename(columns={"ccc": "ccc_b"}),
+                     on="held_out_session")
+              .dropna(subset=["ccc_a", "ccc_b"]))
+
+    a_vals = merged["ccc_a"].values
+    b_vals = merged["ccc_b"].values
+    wx = wilcoxon_test(a_vals, b_vals)
+    sf = sign_flip_test(a_vals, b_vals)
+    return {"model": model, "target": target,
+            "cond_a": cond_a, "cond_b": cond_b,
+            "median_delta": wx["median_delta"],
+            "wilcoxon_p":   wx["p_value"],
+            "signflip_p":   sf["p_value"],
+            "n_sessions":   wx["n"]}
 
 
 def annotation_agreement(
